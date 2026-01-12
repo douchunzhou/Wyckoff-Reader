@@ -1,14 +1,10 @@
 name: Daily Stock AI Report (BJT 12:00 & 16:00 + Telegram DM)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    # GitHub Actions schedule uses UTC time.
-    # Beijing Time (UTC+8):
-    # 12:00 BJT -> 04:00 UTC
-    - cron: "0 4 * * *"
-    # 16:00 BJT -> 08:00 UTC
-    - cron: "0 8 * * *"
+    - cron: "0 4 * * *"   # 12:00 Beijing (UTC 04:00)
+    - cron: "0 8 * * *"   # 16:00 Beijing (UTC 08:00)
 
 permissions:
   contents: write
@@ -55,7 +51,6 @@ jobs:
 
           git commit -m "chore: daily report" || echo "No changes to commit"
 
-          # Sync remote updates then push to avoid "fetch first"
           git pull --rebase origin main
           git push origin HEAD:main
 
@@ -66,14 +61,11 @@ jobs:
         run: |
           set -e
 
-          # Find the newest report
           REPORT_FILE=$(ls -1t reports/*.md | head -n 1)
 
-          # Title from first line (strip leading #), fallback if empty
           TITLE=$(head -n 1 "$REPORT_FILE" | sed 's/^#\+\s*//g' | xargs || true)
           if [ -z "$TITLE" ]; then TITLE="Daily Stock AI Report"; fi
 
-          # Summary: first 80 lines to avoid Telegram message limits
           SUMMARY=$(head -n 80 "$REPORT_FILE")
 
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
