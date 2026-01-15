@@ -1,41 +1,58 @@
-项目名称：A-Share Wyckoff AI Analyst (A股威科夫AI分析师)
+📈 AI Wyckoff Stock Analyst (A-Share)
+全自动 A 股威科夫分析师 —— 这是一个基于 GitHub Actions 的自动化金融量化项目。它每天定时抓取 A 股分钟级数据，利用 Google Gemini / OpenAI 扮演“理查德·威科夫”，生成包含专业图表和深度逻辑分析的 PDF 研报，并自动推送到 Telegram。
 
+核心理念：位置第一，形态第二。不预测，只推演。
 
-本人第一个项目，感谢chatgpt/gemini的大力支持，纯ai手搓。欢迎留言交流
+✨ 核心功能 (Key Features)
+📊 数据自动清洗与获取
 
-           
-[简介]
-这是一个基于 Python 的自动化工具，结合 Akshare 数据接口与 AI 大模型（GPT-4o / DeepSeek），自动拉取 A 股分钟级 K 线，绘制威科夫风格图表，并生成专业操盘分析报告。
+集成 AkShare (东方财富接口)，支持 A 股 1 分钟/日线数据抓取。
 
-[核心功能]
-1. 数据：自动获取 A 股实时/历史分钟数据。
-2. 绘图：本地生成含 MA50/MA200 及成交量的 K 线图。
-3. 分析：AI 模拟威科夫本人，基于供求定律进行趋势推演。
-4. 推送：支持 GitHub Actions 定时运行并推送 Telegram。
+智能修复：自动识别并修复分钟线 Open=0 的异常数据，确保 K 线完整。
 
-[安装依赖]
-请确保安装 Python 3.8+，并在终端运行：
-pip install pandas akshare mplfinance openai requests
+🧠 双引擎 AI 分析 (Dual-Core AI)
 
-[环境变量配置]
-程序通过环境变量控制，支持本地或 CI/CD 环境：
+首选通道：Google Gemini 1.5/2.0 Flash (HTTP 直连，速度快，免费额度高)。
 
-- OPENAI_API_KEY  (必填): 你的 API 密钥
-- SYMBOL          (选填): 股票代码 (默认 600970)
-- BARS_COUNT      (选填): 分析 K 线数量 (默认 600)
-- OPENAI_BASE_URL (选填): 自定义接口地址 (如 DeepSeek 需填 https://api.deepseek.com)
-- AI_MODEL        (选填): 模型名称 (默认 gpt-4o-mini)
+灾备通道：OpenAI GPT-4o (当 Gemini 不可用时自动无缝切换)。
 
-[运行方法]
-1. Linux/Mac:
-   export OPENAI_API_KEY="sk-xxxx"
-   python main.py
+威科夫人格：AI 严格遵循威科夫操盘法，分析供求关系、努力与结果、TR 区间及关键行为 (Spring/UT/LPS)。
 
-2. Windows CMD/PowerShell:
-   set OPENAI_API_KEY=sk-xxxx
-   python main.py
+📈 专业级绘图
 
-[输出结果]
-运行成功后，文件将保存在 reports/ 目录下：
-- .png 文件：威科夫 K 线图表
-- .md  文件：AI 分析报告
+使用 mplfinance 绘制专业蜡烛图。
+
+配置 MA50 / MA200 双均线系统作为背景趋势参考。
+
+采用红涨绿跌（符合 A 股习惯）的高对比度配色。
+
+📑 PDF 研报生成
+
+自动将 K 线图表与 AI Markdown 分析报告合并。
+
+完美支持中文：内置字体配置，解决 Linux 环境下 PDF 中文乱码问题。
+
+🤖 自动化与推送
+
+GitHub Actions：每天定时运行 (午盘 12:00 / 收盘 15:15)。
+
+Telegram Bot：直接将生成的 PDF 文件发送到你的手机。
+
+📂 项目结构
+├── .github/
+│   └── workflows/
+│       └── daily.yml      # GitHub Actions 自动化配置
+├── data/                  # 存放下载的 CSV 数据 (自动生成)
+├── reports/               # 存放生成的 PNG/MD/PDF (自动生成)
+├── main.py                # 核心主程序
+├── requirements.txt       # 依赖列表
+└── README.md              # 项目说明
+
+⚠️ 免责声明 (Disclaimer)
+本项目仅供技术研究与学习使用。
+不构成投资建议：AI 生成的分析报告可能存在幻觉或错误，不能作为买卖依据。
+数据延迟：免费数据接口可能存在延迟或不稳定性。
+风险自负：股市有风险，入市需谨慎。
+
+📧 联系与反馈
+如有问题或建议，欢迎提交 Issue 或 Pull Request。
