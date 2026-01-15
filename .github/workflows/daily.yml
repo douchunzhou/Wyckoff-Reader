@@ -22,6 +22,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      # === 新增：安装中文字体 (解决PDF乱码) ===
+      - name: Install Chinese Fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-wqy-microhei ttf-wqy-microhei
+          fc-cache -f -v
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -30,20 +37,19 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas akshare mplfinance openai requests
+          # 新增 markdown 和 xhtml2pdf 用于生成 PDF
+          pip install pandas akshare mplfinance openai requests markdown xhtml2pdf
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run Analysis Script
         env:
-          # === 1. Google Gemini 配置 (指定 gemini-3-flash-preview) ===
+          # === Google Gemini ===
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: "gemini-3-flash-preview"
-          
-          # === 2. 官方 OpenAI 配置 (备用) ===
+          # === OpenAI ===
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_MODEL: "gpt-4o"
-          
-          # === 3. 通用配置 ===
+          # === Common ===
           WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
           SYMBOL: "600970" 
           BARS_COUNT: "600"
@@ -54,8 +60,7 @@ jobs:
       - name: Cleanup old data
         run: |
           echo "Cleaning up files older than 7 days..."
-          find reports/ -name "*.md" -type f -mtime +7 -print -delete
-          find reports/ -name "*.png" -type f -mtime +7 -print -delete
+          find reports/ -name "*.*" -type f -mtime +7 -print -delete
           find data/ -name "*.csv" -type f -mtime +7 -print -delete
 
       - name: Commit and push changes
@@ -71,7 +76,7 @@ jobs:
             git push origin HEAD:main
           fi
 
-      - name: Notify Telegram
+      - name: Notify Telegram (PDF)
         if: success()
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -79,73 +84,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export LANG=C.UTF-8
           
-          echo "=== 1. 查找最新报告 ==="
-          # 查找最新的 md 文件 (处理文件名空格问题)
-          REPORT_FILE=$(find reports -name "*.md" -type f -printf "%T@ %p\n" | sort -n | tail -1 | cut -d' ' -f2-)
-          
-          # 查找最新的 png 文件
-          CHART_FILE=$(find reports -name "*.png" -type f -printf "%T@ %p\n" | sort -n | tail -1 | cut -d' ' -f2-)
+          echo "=== 查找 PDF 报告 ==="
+          # 查找最新的 PDF 文件
+          PDF_FILE=$(find reports -name "*.pdf" -type f -printf "%T@ %p\n" | sort -n | tail -1 | cut -d' ' -f2-)
 
-          if [ ! -f "$REPORT_FILE" ]; then 
-            echo "::warning::没有找到报告文件，跳过通知。"
+          if [ -z "${PDF_FILE:-}" ]; then 
+            echo "::warning::没有找到 PDF 文件，跳过通知。"
             exit 0
           fi
           
-          echo "Found Report: $REPORT_FILE"
-
-          # === 2. 准备图片 ===
-          HAS_IMAGE=false
-          if [ -n "${CHART_FILE:-}" ] && [ -f "$CHART_FILE" ]; then
-             echo "Found Chart: $CHART_FILE"
-             # 确保使用绝对路径复制
-             cp "$CHART_FILE" /tmp/chart.png
-             HAS_IMAGE=true
-          else
-             echo "No chart image found."
-          fi
-
-          # === 3. 准备文案 (保存到文件，避免 Shell 转义错误) ===
-          python - "$REPORT_FILE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" <<'PY' > /tmp/caption.txt
-          import pathlib, sys
-          path, server, repo = sys.argv[1], sys.argv[2], sys.argv[3]
-          try:
-              text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
-              lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-              
-              # 提取标题
-              title = lines[0].lstrip("#").strip() if lines else "AI Analysis"
-              
-              # 提取正文 (截取前 900 字符防止超长)
-              # 跳过前两行(通常是标题和图片链接)
-              body_lines = lines[2:40]
-              summary = "\n".join(body_lines)[:900]
-              
-              # 生成 HTML 格式消息
-              msg = f"<b>{title}</b>\n\n{summary}\n\n... <a href='{server}/{repo}'>查看完整版</a>"
-              print(msg)
-          except Exception as e:
-              print(f"Error parsing report: {e}")
-          PY
+          echo "Found PDF: $PDF_FILE"
           
-          echo "Caption saved to /tmp/caption.txt"
-
-          # === 4. 发送请求 (使用文件的形式传参，修复 exit code 26) ===
-          if [ "$HAS_IMAGE" = true ]; then
-            echo "Sending Photo..."
-            # 注意: caption=</tmp/caption.txt 表示让 curl 直接读取文件内容作为字段值
-            # 这样可以完美避开所有引号、换行符导致的 Shell 错误
-            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" \
-              -F "chat_id=${TG_CHAT_ID}" \
-              -F "photo=@/tmp/chart.png" \
-              -F "parse_mode=HTML" \
-              -F "caption=</tmp/caption.txt"
-          else
-            echo "Sending Text..."
-            # 对于纯文本消息，我们也读取文件内容发送
-            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-              -d "chat_id=${TG_CHAT_ID}" \
-              -d "parse_mode=HTML" \
-              --data-urlencode "text=$(cat /tmp/caption.txt)"
-          fi
+          # 简单的文件名作为 caption
+          FILENAME=$(basename "$PDF_FILE")
+          
+          echo "Sending Document..."
+          curl -v -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
+            -F "chat_id=${TG_CHAT_ID}" \
+            -F "document=@$PDF_FILE" \
+            -F "caption=📊 Stock Analysis: $FILENAME"
