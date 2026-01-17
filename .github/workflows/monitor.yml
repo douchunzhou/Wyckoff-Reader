@@ -3,8 +3,8 @@ name: Monitor Telegram for New Stocks
 on:
   workflow_dispatch:      # 允许手动触发
   schedule:
-    # UTC 1:00 - 9:00 = 北京时间 9:00 - 17:00 (每30分钟运行一次)
-    - cron: "*/30 1-9 * * *"
+    # UTC 0:00 - 9:00 = 北京时间 8:00 - 17:00 (每30分钟运行一次)
+    - cron: "*/30 0-9 * * *"
 
 permissions:
   contents: write
