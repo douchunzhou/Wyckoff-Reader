@@ -41,7 +41,7 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     if df.empty:
         return {"df": pd.DataFrame(), "period": "5m"}
 
-    # 3. 策略切换 (数据量大时切15分钟)
+    # 3. 策略切换
     current_period = "5m"
     if len(df) > 960:
         try:
@@ -98,7 +98,7 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
         print(f"   [Error] {symbol} 绘图失败: {e}")
 
 # ==========================================
-# 3. AI 分析模块
+# 3. AI 分析模块 (针对 429 优化)
 # ==========================================
 
 def get_prompt_content(symbol, df, position_info):
@@ -137,7 +137,6 @@ def call_gemini_http(prompt: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key: raise ValueError("GEMINI_API_KEY missing")
     
-    # 直接信任环境变量
     model_name = os.getenv("GEMINI_MODEL") 
     if not model_name: model_name = "gemini-1.5-flash"
     
@@ -158,36 +157,52 @@ def call_gemini_http(prompt: str) -> str:
         "safetySettings": safety_settings 
     }
     
-    resp = requests.post(url, headers=headers, json=data, timeout=300)
-    
-    if resp.status_code != 200: 
-        raise Exception(f"Gemini API Error {resp.status_code}: {resp.text}")
-    
-    try:
-        result = resp.json()
-        if "error" in result:
-            raise Exception(f"API Error Logic: {result['error']}")
-
-        candidates = result.get('candidates', [])
-        if not candidates:
-            feedback = result.get('promptFeedback', 'No Feedback')
-            raise ValueError(f"No candidates returned. Feedback: {feedback}")
-        
-        content = candidates[0].get('content', {})
-        parts = content.get('parts', [])
-        
-        if not parts:
-            finish_reason = candidates[0].get('finishReason', 'UNKNOWN')
-            raise ValueError(f"Content parts empty. FinishReason: {finish_reason}")
+    # Retry Logic
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 180s 超时
+            resp = requests.post(url, headers=headers, json=data, timeout=180)
             
-        text = parts[0].get('text', '')
-        if not text: raise ValueError("Empty text")
-        
-        return text
+            if resp.status_code == 200:
+                result = resp.json()
+                if "error" in result: raise Exception(f"Logic Error: {result['error']}")
+                
+                candidates = result.get('candidates', [])
+                if not candidates: raise ValueError("No candidates")
+                
+                content = candidates[0].get('content', {})
+                parts = content.get('parts', [])
+                if not parts: raise ValueError("Empty parts")
+                
+                text = parts[0].get('text', '')
+                if not text: raise ValueError("Empty text")
+                
+                return text 
+            
+            # === 429 限流处理 ===
+            elif resp.status_code == 429:
+                print(f"   🛑 Gemini 429 Rate Limit (Attempt {attempt+1}/{max_retries})... Waiting 60s")
+                time.sleep(60) # 强制等待60秒，适应 Gemini 3 的严格限制
+                continue
 
-    except Exception as e:
-        print(f"   [Debug] {model_name} 解析失败. 响应片段:\n{resp.text[:500]}") 
-        raise e 
+            # === 503 过载处理 ===
+            elif resp.status_code == 503:
+                print(f"   ⚠️ Gemini 503 Overloaded (Attempt {attempt+1}/{max_retries})... Waiting 5s")
+                time.sleep(5)
+                continue
+            
+            else:
+                raise Exception(f"HTTP {resp.status_code}: {resp.text}")
+
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"   ❌ Gemini Final Fail: {e}")
+                raise e
+            print(f"   ⚠️ Gemini Error (Attempt {attempt+1}): {e}... Retrying")
+            time.sleep(3)
+            
+    raise Exception("Gemini Max Retries Exceeded")
 
 def call_openai_official(prompt: str) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -210,7 +225,7 @@ def ai_analyze(symbol, df, position_info):
     try: 
         return call_gemini_http(prompt)
     except Exception as e: 
-        print(f"   ⚠️ [{symbol}] Gemini ({os.getenv('GEMINI_MODEL')}) 失败: {e} -> 切 OpenAI")
+        print(f"   ⚠️ [{symbol}] Gemini 彻底失败 -> 切 OpenAI")
         try: 
             return call_openai_official(prompt)
         except Exception as e2: 
@@ -276,7 +291,6 @@ def process_one_stock(symbol: str, position_info: dict):
     beijing_tz = timezone(timedelta(hours=8))
     ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S")
     
-    # 保存CSV
     csv_path = f"data/{clean_symbol}_{period}_{ts}.csv"
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
@@ -307,8 +321,9 @@ def main():
 
     generated_pdfs = []
     
-    # 5线程并发
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    # ⚠️ 【关键修改】改为单线程 (max_workers=1)
+    # 避免并发触发 Rate Limit
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future_to_symbol = {
             executor.submit(process_one_stock, symbol, info): symbol 
             for symbol, info in stocks_dict.items()
@@ -334,5 +349,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
