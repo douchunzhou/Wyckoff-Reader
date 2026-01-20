@@ -9,7 +9,7 @@ from openai import OpenAI
 import numpy as np
 import markdown
 from xhtml2pdf import pisa
-# === 新增：引入 Google Sheets 管理模块 ===
+# 引入 Google Sheets 管理模块
 from sheet_manager import SheetManager 
 
 # ==========================================
@@ -26,7 +26,7 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     symbol_code = ''.join(filter(str.isdigit, symbol))
     print(f"   -> 正在分析 {symbol_code} (买入日期: {buy_date_str})...")
 
-    # 1. 计算开始时间 (近似倒推10-15个自然日)
+    # 1. 计算开始时间 (近似倒推15个自然日)
     try:
         if buy_date_str and buy_date_str != 'Unknown':
             buy_dt = datetime.strptime(buy_date_str, "%Y-%m-%d")
@@ -162,7 +162,6 @@ def get_prompt_content(symbol, df, position_info):
     try:
         buy_price = float(position_info.get('price', 0))
         buy_date = position_info.get('date', 'Unknown')
-        qty = position_info.get('qty', 0)
     except:
         buy_price = 0
     
@@ -205,7 +204,12 @@ def call_gemini_http(prompt: str) -> str:
     }
     resp = requests.post(url, headers=headers, json=data)
     if resp.status_code != 200: raise Exception(f"Gemini API Error {resp.status_code}: {resp.text}")
-    return resp.json()['candidates'][0]['content']['parts'][0]['text']
+    
+    # 安全获取响应内容
+    try:
+        return resp.json()['candidates'][0]['content']['parts'][0]['text']
+    except Exception as e:
+        raise Exception(f"Gemini 响应解析失败: {resp.text}")
 
 def call_openai_official(prompt: str) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -222,7 +226,6 @@ def call_openai_official(prompt: str) -> str:
     return resp.choices[0].message.content
 
 def ai_analyze(symbol, df, position_info):
-    # 注意：这里多传了一个 position_info 参数
     prompt = get_prompt_content(symbol, df, position_info)
     if not prompt: return "Error: No Prompt"
     
@@ -318,7 +321,53 @@ def process_one_stock(symbol: str, position_info: dict, generated_files: list):
     if generate_pdf_report(symbol, chart_path, report_text, pdf_path):
         generated_files.append(pdf_path)
     
-    # 调试用 MD
+    # 调试用 MD (修复了这里的闭合问题)
     md_path = f"reports/{symbol}_report_{ts}.md"
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write(report
+        f.write(report_text)
+    
+    print(f"✅ {symbol} 处理完成")
+
+def main():
+    os.makedirs("data", exist_ok=True)
+    os.makedirs("reports", exist_ok=True)
+
+    print("☁️ 正在连接 Google Sheets 获取持仓列表...")
+    
+    try:
+        sm = SheetManager()
+        stocks_dict = sm.get_all_stocks()
+        print(f"📋 成功获取 {len(stocks_dict)} 只股票任务")
+    except Exception as e:
+        print(f"❌ Google Sheets 连接失败: {e}")
+        return
+
+    if not stocks_dict:
+        print("⚠️ 列表为空，结束。")
+        return
+
+    # 2. 循环处理
+    generated_pdfs = []
+    
+    for i, (symbol, info) in enumerate(stocks_dict.items()):
+        try:
+            process_one_stock(symbol, info, generated_pdfs)
+        except Exception as e:
+            print(f"❌ {symbol} 错误: {e}")
+        
+        # 防止接口限流
+        if i < len(stocks_dict) - 1:
+            time.sleep(10)
+
+    # 3. 生成推送清单
+    if generated_pdfs:
+        print(f"\n📝 生成推送清单 ({len(generated_pdfs)} 个文件):")
+        with open("push_list.txt", "w", encoding="utf-8") as f:
+            for pdf in generated_pdfs:
+                print(f"   -> {pdf}")
+                f.write(f"{pdf}\n")
+    else:
+        print("\n⚠️ 本次没有生成任何 PDF，不创建 push_list.txt")
+
+if __name__ == "__main__":
+    main()
