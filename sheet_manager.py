@@ -24,17 +24,15 @@ class SheetManager:
         try:
             self.client = gspread.authorize(creds)
             print("   ✅ Google Auth 认证成功")
-            print(f"   🤖 当前机器人: {creds.service_account_email}")
         except Exception as e:
             raise Exception(f"❌ Google Auth 失败: {e}")
 
-        # 3. 连接表格 (优先 ID，后文件名)
+        # 3. 连接表格
         sheet_name_or_id = os.getenv("SHEET_NAME")
         if not sheet_name_or_id:
             raise ValueError("❌ 环境变量 SHEET_NAME 未找到")
 
         try:
-            # 尝试按 ID 打开 (如果是长字符串)
             if len(sheet_name_or_id) > 20: 
                 self.sh = self.client.open_by_key(sheet_name_or_id)
                 print(f"   ✅ [成功] 已通过 ID 连接到表格！")
@@ -44,80 +42,85 @@ class SheetManager:
                 print(f"   ✅ [成功] 已通过文件名连接到表格！")
         except gspread.SpreadsheetNotFound:
             print(f"   ❌ 找不到名为 '{sheet_name_or_id}' 的表格。")
-            print("   ⚠️ 请确保表格已分享给机器人邮箱 (见上文)")
             raise
 
-        # 默认操作第一个工作表
         self.sheet = self.sh.sheet1
 
     def get_all_stocks(self):
-        """
-        获取所有股票配置，返回字典格式
-        Format: {'000001': {'date': '2023-01-01', 'price': 10.5, 'qty': 100}, ...}
-        """
+        """获取所有股票配置"""
         all_values = self.sheet.get_all_values()
-        if not all_values:
-            return {}
+        if not all_values: return {}
         
-        # 跳过表头 (假设第一行是 Code, BuyDate, Price, Qty)
-        headers = all_values[0]
         data_rows = all_values[1:]
-        
         stocks = {}
         for row in data_rows:
             if not row or not row[0].strip(): continue
             
-            # 强制补全6位代码
             raw_symbol = row[0].strip()
             digits = ''.join(filter(str.isdigit, raw_symbol))
             symbol = digits.zfill(6)
             
-            # 安全获取其他列
+            # 安全获取
             buy_date = row[1].strip() if len(row) > 1 else ""
             price = row[2].strip() if len(row) > 2 else ""
             qty = row[3].strip() if len(row) > 3 else ""
             
-            stocks[symbol] = {
-                "date": buy_date,
-                "price": price,
-                "qty": qty
-            }
+            stocks[symbol] = {"date": buy_date, "price": price, "qty": qty}
         return stocks
 
     def add_or_update_stock(self, symbol, date='', price='', qty=''):
-        """
-        添加或更新股票 (修复了 NoneType 和 CellNotFound 错误)
-        """
-        # 1. 格式化代码
+        """添加或更新，并返回详细信息"""
         clean_symbol = ''.join(filter(str.isdigit, str(symbol))).zfill(6)
         print(f"   🔍 正在查找股票: {clean_symbol}")
         
         try:
-            # 2. 查找是否存在 (find 返回 Cell 对象或 None)
             cell = self.sheet.find(clean_symbol)
+            action_type = ""
             
             if cell:
-                # === 更新逻辑 ===
                 print(f"   Found at Row {cell.row}. Updating...")
                 row = cell.row
-                # 如果提供了新值，才更新对应列
-                # 假设列顺序: A=Code(1), B=Date(2), C=Price(3), D=Qty(4)
-                if date: 
-                    self.sheet.update_cell(row, 2, str(date))
-                if price: 
-                    self.sheet.update_cell(row, 3, str(price))
-                if qty: 
-                    self.sheet.update_cell(row, 4, str(qty))
-                return f"✅ 已更新 {clean_symbol}"
-            
+                # 只有当参数不为空时才更新，为空则保留原值（或者你可以选择覆盖为空）
+                # 这里假设传入空字符串代表“不修改该字段”
+                if date: self.sheet.update_cell(row, 2, str(date))
+                if price: self.sheet.update_cell(row, 3, str(price))
+                if qty: self.sheet.update_cell(row, 4, str(qty))
+                action_type = "✅ 已更新"
             else:
-                # === 新增逻辑 ===
                 print(f"   Not found. Appending new row...")
-                # 追加一行: [Code, Date, Price, Qty]
                 self.sheet.append_row([clean_symbol, str(date), str(price), str(qty)])
-                return f"🆕 已添加关注 {clean_symbol}"
+                action_type = "🆕 新增关注"
+
+            # 重新读取该行数据以确认（确保返回给用户的是数据库里的真实值）
+            # 为了性能，这里直接用传入值构建返回字符串
+            # 如果没传入，给个提示
+            show_date = date if date else "(未变动/空)"
+            show_price = price if price else "(未变动/空)"
+            show_qty = qty if qty else "(未变动/空)"
+
+            return (
+                f"{action_type} {clean_symbol}\n"
+                f"──────\n"
+                f"📅 日期: {show_date}\n"
+                f"💰 成本: {show_price}\n"
+                f"📦 持仓: {show_qty}"
+            )
                 
         except Exception as e:
             print(f"   ❌ 操作表格失败: {e}")
-            # 抛出异常以便上层捕获
             raise e
+
+    def remove_stock(self, symbol):
+        """删除指定的股票行"""
+        clean_symbol = ''.join(filter(str.isdigit, str(symbol))).zfill(6)
+        print(f"   🔍 正在查找要删除的股票: {clean_symbol}")
+        
+        try:
+            cell = self.sheet.find(clean_symbol)
+            if cell:
+                self.sheet.delete_rows(cell.row)
+                return f"🗑️ 已从关注列表中移除 {clean_symbol}"
+            else:
+                return f"⚠️ 列表中未找到 {clean_symbol}，无需删除"
+        except Exception as e:
+            return f"❌ 删除失败: {e}"
