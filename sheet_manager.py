@@ -47,7 +47,10 @@ class SheetManager:
         self.sheet = self.sh.sheet1
 
     def get_all_stocks(self):
-        """获取所有股票配置"""
+        """
+        获取所有股票配置
+        New Format: Code, Date, Price, Qty, Timeframe(Col5), Bars(Col6)
+        """
         all_values = self.sheet.get_all_values()
         if not all_values: return {}
         
@@ -60,16 +63,31 @@ class SheetManager:
             digits = ''.join(filter(str.isdigit, raw_symbol))
             symbol = digits.zfill(6)
             
-            # 安全获取
+            # 安全获取各项配置
             buy_date = row[1].strip() if len(row) > 1 else ""
             price = row[2].strip() if len(row) > 2 else ""
             qty = row[3].strip() if len(row) > 3 else ""
             
-            stocks[symbol] = {"date": buy_date, "price": price, "qty": qty}
+            # === 新增自定义列 ===
+            # 如果表格里没填，默认给 None，交给 main.py 处理默认值
+            timeframe = row[4].strip() if len(row) > 4 else "5"
+            bars = row[5].strip() if len(row) > 5 else "500"
+            
+            # 简单的清洗，确保不为空
+            if not timeframe: timeframe = "5"
+            if not bars: bars = "500"
+            
+            stocks[symbol] = {
+                "date": buy_date, 
+                "price": price, 
+                "qty": qty,
+                "timeframe": timeframe, # 新增
+                "bars": bars            # 新增
+            }
         return stocks
 
     def add_or_update_stock(self, symbol, date='', price='', qty=''):
-        """添加或更新"""
+        """添加或更新 (保持原样，新增列需手动在表格调整或后续升级指令)"""
         clean_symbol = ''.join(filter(str.isdigit, str(symbol))).zfill(6)
         print(f"   🔍 正在查找股票: {clean_symbol}")
         
@@ -86,7 +104,8 @@ class SheetManager:
                 action_type = "✅ 已更新"
             else:
                 print(f"   Not found. Appending new row...")
-                self.sheet.append_row([clean_symbol, str(date), str(price), str(qty)])
+                # 默认追加时，周期和根数留空(使用默认)
+                self.sheet.append_row([clean_symbol, str(date), str(price), str(qty), "5", "500"])
                 action_type = "🆕 新增关注"
 
             show_date = date if date else "-"
@@ -103,10 +122,7 @@ class SheetManager:
             raise e
 
     def remove_stock(self, symbol):
-        """删除指定的股票行"""
         clean_symbol = ''.join(filter(str.isdigit, str(symbol))).zfill(6)
-        print(f"   🔍 正在查找要删除的股票: {clean_symbol}")
-        
         try:
             cell = self.sheet.find(clean_symbol)
             if cell:
@@ -117,22 +133,21 @@ class SheetManager:
         except Exception as e:
             return f"❌ 删除失败: {e}"
 
-    # === 👇 新增：获取全部持仓文本摘要 ===
     def get_portfolio_summary(self):
-        """返回格式化后的所有持仓列表字符串"""
         stocks = self.get_all_stocks()
         if not stocks:
             return "\n📭 当前关注列表为空"
 
-        # 构建漂亮的列表
         summary_lines = [f"\n📊 当前持仓汇总 ({len(stocks)}):"]
         summary_lines.append("────────────────")
         
         for symbol, info in stocks.items():
-            # 简单展示格式：🔹 000001 (10.5 / 1000)
             details = []
             if info['price']: details.append(f"💰{info['price']}")
-            if info['qty']: details.append(f"📦{info['qty']}")
+            # 显示周期设置
+            tf = info.get('timeframe', '5')
+            bar = info.get('bars', '500')
+            details.append(f"⏱️{tf}m/{bar}")
             
             detail_str = f" ({' '.join(details)})" if details else ""
             summary_lines.append(f"🔹 `{symbol}`{detail_str}")
