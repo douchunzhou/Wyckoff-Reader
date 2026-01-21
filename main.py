@@ -59,6 +59,7 @@ def _is_quota_exhausted(resp: requests.Response) -> bool:
     return False
 
 def call_gemini_http(prompt: str) -> str:
+    """第一优先级：Google 官方 API"""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key: raise ValueError("GEMINI_API_KEY missing")
 
@@ -67,12 +68,9 @@ def call_gemini_http(prompt: str) -> str:
 
     session = requests.Session()
     
-    # ✅ 核心修复：添加 User-Agent 和 Connection: close
     headers = {
         "Content-Type": "application/json",
-        # 伪装成 Chrome 浏览器，防止被防火墙拦截
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        # 强制短连接：每次请求后断开，防止复用已失效的 TCP 连接导致 RemoteDisconnected
         "Connection": "close"
     }
 
@@ -89,7 +87,8 @@ def call_gemini_http(prompt: str) -> str:
         "safetySettings": safety_settings,
     }
 
-    max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
+    # ⚠️ 修改点：默认重试次数改为 1
+    max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "1"))
     base_sleep = float(os.getenv("GEMINI_BASE_SLEEP", "3.0"))
     timeout_s = int(os.getenv("GEMINI_TIMEOUT", "120"))
 
@@ -97,7 +96,6 @@ def call_gemini_http(prompt: str) -> str:
 
     for attempt in range(1, max_retries + 1):
         try:
-            # 使用 verify=True 保持 SSL 安全，如果本地代理证书有问题，可改为 False (但不推荐)
             resp = session.post(url, headers=headers, json=data, timeout=timeout_s)
 
             if resp.status_code == 200:
@@ -107,9 +105,8 @@ def call_gemini_http(prompt: str) -> str:
                 except:
                     raise ValueError(f"Invalid response: {str(result)[:200]}")
             
-            # 🛑 致命错误熔断
             if resp.status_code == 400:
-                raise GeminiFatalError(f"Gemini API Key 无效或参数错误 (HTTP 400): {resp.text[:200]}")
+                raise GeminiFatalError(f"Gemini Key/Params Error (400): {resp.text[:200]}")
 
             if resp.status_code == 429:
                 if _is_quota_exhausted(resp):
@@ -160,7 +157,6 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     symbol_code = clean_digits.zfill(6)
     
-    # 1. 参数解析
     try: tf_min = int(timeframe_str)
     except: tf_min = 5
     
@@ -171,7 +167,6 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
         print(f"   ⚠️ 周期 {tf_min} 非标准(支持1/5/15/30/60)，调整为 60", flush=True)
         tf_min = 60
     
-    # 2. 动态计算需要的历史天数
     total_minutes = limit * tf_min
     days_back = int((total_minutes / 240) * 2.5) + 10 
     
@@ -182,7 +177,7 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
     source_msg = "AkShare Only" if tf_min == 1 else "BaoStock+AkShare"
     print(f"   🔍 获取 {symbol_code}: 周期={tf_min}m, 目标={limit}根 ({source_msg})", flush=True)
 
-    # === A. BaoStock 历史 (仅当周期 >= 5 时启用) ===
+    # === A. BaoStock 历史 ===
     df_bs = pd.DataFrame()
     if tf_min >= 5:
         try:
@@ -210,7 +205,7 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
         except Exception as e:
             print(f"   [BaoStock] 异常: {e}", flush=True)
 
-    # === B. AkShare 数据获取 ===
+    # === B. AkShare 数据 ===
     ak_fetch_start = start_date_ak_str if tf_min == 1 else (datetime.now() - timedelta(days=20)).strftime("%Y%m%d")
     
     df_ak = pd.DataFrame()
@@ -229,7 +224,7 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
     except Exception as e:
         print(f"   [AkShare] 异常: {e}", flush=True)
 
-    # === C. 合并与清洗 ===
+    # === C. 合并 ===
     if df_bs.empty and df_ak.empty:
         return {"df": pd.DataFrame(), "period": f"{tf_min}m"}
     
@@ -251,7 +246,6 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
                 print(f"   ⚖️ 修正 BaoStock 单位 (x100)", flush=True)
                 df_bs['volume'] = df_bs['volume'] * 100
 
-    # ⚠️ ignore_index=True 防止重复索引
     df_final = pd.concat([df_bs, df_ak], axis=0, ignore_index=True)
     df_final = df_final[["date", "open", "high", "low", "close", "volume"]]
     df_final = df_final.drop_duplicates(subset=['date'], keep='last')
@@ -295,7 +289,7 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
 
 
 # ==========================================
-# 3. AI 分析模块
+# 3. AI 分析模块 (三级兜底)
 # ==========================================
 
 _PROMPT_CACHE = None
@@ -344,10 +338,31 @@ def get_prompt_content(symbol, df, position_info):
     return base_prompt + position_text
 
 def call_openai_official(prompt: str) -> str:
+    """第三优先级：OpenAI / DeepSeek (原版)"""
     api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key: raise ValueError("OpenAI Key missing")
+    if not api_key: raise ValueError("OPENAI_API_KEY missing")
     model_name = os.getenv("AI_MODEL", "gpt-4o")
     client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "system", "content": "You are Richard D. Wyckoff."}, {"role": "user", "content": prompt}],
+        temperature=0.2
+    )
+    return resp.choices[0].message.content
+
+def call_custom_api(prompt: str) -> str:
+    """第二优先级：Qiandao Custom API"""
+    # 这里的 KEY 需要在 Github Secrets 里配置，例如 CUSTOM_API_KEY
+    # 如果没有配置，这里会报错，然后自动切到 OpenAI
+    api_key = os.getenv("CUSTOM_API_KEY") 
+    if not api_key: 
+        raise ValueError("CUSTOM_API_KEY missing, skipping custom API")
+    
+    base_url = "https://api2.qiandao.mom/v1"
+    model_name = "gemini-3-pro-preview-h"
+    
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    
     resp = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "system", "content": "You are Richard D. Wyckoff."}, {"role": "user", "content": prompt}],
@@ -359,24 +374,23 @@ def ai_analyze(symbol, df, position_info):
     prompt = get_prompt_content(symbol, df, position_info)
     if not prompt: return "Error: No Prompt"
 
+    # === Level 1: Google Official Gemini ===
     try:
         return call_gemini_http(prompt)
-    except GeminiFatalError as fe:
-        print(f"   ⚠️ [{symbol}] Gemini 致命错误 (Key无效/参数错) -> OpenAI: {str(fe)[:100]}", flush=True)
-        try: return call_openai_official(prompt)
-        except Exception as e2: return f"Analysis Failed. OpenAI Err: {e2}"
-    except GeminiQuotaExceeded as qe:
-        print(f"   ⚠️ [{symbol}] Gemini 配额耗尽 -> OpenAI", flush=True)
-        try: return call_openai_official(prompt)
-        except Exception as e2: return f"Analysis Failed. OpenAI Err: {e2}"
-    except GeminiRateLimited as rl:
-        print(f"   ⚠️ [{symbol}] Gemini 限流重试失败 -> OpenAI", flush=True)
-        try: return call_openai_official(prompt)
-        except Exception as e2: return f"Analysis Failed. OpenAI Err: {e2}"
-    except Exception as e:
-        print(f"   ⚠️ [{symbol}] Gemini 异常 -> OpenAI: {str(e)[:100]}", flush=True)
-        try: return call_openai_official(prompt)
-        except Exception as e2: return f"Analysis Failed. OpenAI Err: {e2}"
+    except Exception as e1:
+        print(f"   ⚠️ Gemini Official 失败: {str(e1)[:100]} -> 切 Custom API", flush=True)
+        
+        # === Level 2: Custom API (Qiandao) ===
+        try:
+            return call_custom_api(prompt)
+        except Exception as e2:
+            print(f"   ⚠️ Custom API 失败: {str(e2)[:100]} -> 切 OpenAI", flush=True)
+            
+            # === Level 3: OpenAI / DeepSeek ===
+            try:
+                return call_openai_official(prompt)
+            except Exception as e3:
+                return f"Analysis Failed. All APIs down. Error: {e3}"
 
 
 # ==========================================
@@ -417,7 +431,7 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
 
 
 # ==========================================
-# 5. 主程序 (串行 + 强制休息)
+# 5. 主程序 (串行 + 30s 休息)
 # ==========================================
 
 def process_one_stock(symbol: str, position_info: dict):
@@ -425,13 +439,11 @@ def process_one_stock(symbol: str, position_info: dict):
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     clean_symbol = clean_digits.zfill(6)
 
-    # 🟢 获取自定义配置
     tf_str = position_info.get("timeframe", "5")
     bars_str = position_info.get("bars", "500")
 
     print(f"🚀 [{clean_symbol}] 开始分析 (TF:{tf_str}m, Bars:{bars_str})...", flush=True)
 
-    # 🟢 调用双源数据获取
     data_res = fetch_stock_data_dynamic(clean_symbol, tf_str, bars_str)
     
     df = data_res["df"]
@@ -485,9 +497,10 @@ def main():
         except Exception as e:
             print(f"❌ [{symbol}] 处理发生异常: {e}", flush=True)
 
+        # ⚠️ 修改点：强制冷却缩短为 30 秒
         if i < len(items) - 1:
-            print("⏳ 强制冷却 60秒...", flush=True)
-            time.sleep(60)
+            print("⏳ 强制冷却 30秒...", flush=True)
+            time.sleep(30)
 
     if generated_pdfs:
         print(f"\n📝 生成推送清单 ({len(generated_pdfs)}):", flush=True)
