@@ -4,7 +4,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import akshare as ak
-import baostock as bs  # ✅ 引入 BaoStock
+import baostock as bs
 import mplfinance as mpf
 from openai import OpenAI
 import numpy as np
@@ -137,10 +137,13 @@ def _get_baostock_code(symbol: str) -> str:
     return f"sz.{symbol}"
 
 def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str) -> dict:
+    """
+    Your optimized version: robust datetime parsing, index fixing, and volume alignment.
+    """
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     symbol_code = clean_digits.zfill(6)
     
-    # 1. 参数解析 (支持自定义)
+    # 1. 参数解析
     try: tf_min = int(timeframe_str)
     except: tf_min = 5
     
@@ -173,12 +176,19 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
                 data_list = []
                 while rs.next(): data_list.append(rs.get_row_data())
                 df_bs = pd.DataFrame(data_list, columns=rs.fields)
+                
                 if not df_bs.empty:
-                    df_bs["time"] = pd.to_datetime(df_bs["time"], format="%Y%m%d%H%M%S000", errors='coerce')
-                    df_bs = df_bs.rename(columns={"time": "date"})
+                    # 关键修复：用 time 解析出真正的时间戳
+                    df_bs["date"] = pd.to_datetime(df_bs["time"], format="%Y%m%d%H%M%S000", errors="coerce")
+                    df_bs = df_bs.drop(columns=["time"], errors="ignore")
+                    
                     cols = ["open", "high", "low", "close", "volume"]
-                    df_bs[cols] = df_bs[cols].apply(pd.to_numeric, errors='coerce')
-                    df_bs = df_bs.dropna(subset=['close'])
+                    for c in cols:
+                        df_bs[c] = pd.to_numeric(df_bs[c], errors="coerce")
+                    
+                    df_bs = df_bs.dropna(subset=["date", "close"])
+                    # 强制列顺序
+                    df_bs = df_bs[["date", "open", "high", "low", "close", "volume"]]
         bs.logout()
     except Exception as e:
         print(f"   [BaoStock] 异常: {e}", flush=True)
@@ -186,18 +196,24 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
     # === B. AkShare 实时补全 ===
     df_ak = pd.DataFrame()
     try:
-        # AkShare 稍微多取几天，确保覆盖 BaoStock 缺失的近期数据
         ak_start = (datetime.now() - timedelta(days=20)).strftime("%Y%m%d")
         df_ak = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period=str(tf_min), start_date=ak_start, adjust="qfq")
         if not df_ak.empty:
             rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
             df_ak = df_ak.rename(columns={k: v for k, v in rename_map.items() if k in df_ak.columns})
-            df_ak["date"] = pd.to_datetime(df_ak["date"])
+            
+            df_ak["date"] = pd.to_datetime(df_ak["date"], errors="coerce")
             cols = ["open", "high", "low", "close", "volume"]
-            df_ak[cols] = df_ak[cols].astype(float)
-            if "open" in df_ak.columns:
-                df_ak["open"] = df_ak["open"].replace(0, np.nan)
-                df_ak["open"] = df_ak["open"].fillna(df_ak["close"].shift(1)).fillna(df_ak["close"])
+            for c in cols:
+                df_ak[c] = pd.to_numeric(df_ak[c], errors="coerce")
+            
+            # 0值修复
+            df_ak["open"] = df_ak["open"].replace(0, np.nan)
+            df_ak["open"] = df_ak["open"].fillna(df_ak["close"].shift(1)).fillna(df_ak["close"])
+            
+            df_ak = df_ak.dropna(subset=["date", "close"])
+            # 强制列顺序
+            df_ak = df_ak[["date", "open", "high", "low", "close", "volume"]]
     except Exception as e:
         print(f"   [AkShare] 异常: {e}", flush=True)
 
@@ -205,21 +221,32 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
     if df_bs.empty and df_ak.empty:
         return {"df": pd.DataFrame(), "period": f"{tf_min}m"}
     
+    
+
     # 自动对齐单位 (手 vs 股)
     if not df_bs.empty and not df_ak.empty:
         mean_bs = df_bs['volume'].mean()
         mean_ak = df_ak['volume'].mean()
         if mean_bs > 0 and mean_ak > 0:
             ratio = mean_bs / mean_ak
-            if 80 < ratio < 120:
+            if 800 < ratio < 1200:
+                print(f"   ⚖️ 修正 AkShare 单位 (x1000)", flush=True)
+                df_ak['volume'] = df_ak['volume'] * 1000
+            elif 0.0008 < ratio < 0.0012:
+                print(f"   ⚖️ 修正 BaoStock 单位 (x1000)", flush=True)
+                df_bs['volume'] = df_bs['volume'] * 1000
+            elif 80 < ratio < 120:
                 print(f"   ⚖️ 修正 AkShare 单位 (x100)", flush=True)
                 df_ak['volume'] = df_ak['volume'] * 100
             elif 0.008 < ratio < 0.012:
                 print(f"   ⚖️ 修正 BaoStock 单位 (x100)", flush=True)
                 df_bs['volume'] = df_bs['volume'] * 100
 
-    # ⚠️ 【关键修复】使用 ignore_index=True 重新生成索引，防止索引重复导致 Reindexing Error
+    # ⚠️ 核心修复：ignore_index=True 避免索引冲突
     df_final = pd.concat([df_bs, df_ak], axis=0, ignore_index=True)
+    
+    # 确保列纯净
+    df_final = df_final[["date", "open", "high", "low", "close", "volume"]]
     
     # 去重（保留 AkShare 的最新数据）
     df_final = df_final.drop_duplicates(subset=['date'], keep='last')
@@ -231,6 +258,14 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
         df_final = df_final.tail(limit).reset_index(drop=True)
 
     return {"df": df_final, "period": f"{tf_min}m"}
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "close" in df.columns:
+        df["ma50"] = df["close"].rolling(50).mean()
+        df["ma200"] = df["close"].rolling(200).mean()
+    return df
+
 
 # ==========================================
 # 2. 绘图模块
@@ -458,4 +493,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
