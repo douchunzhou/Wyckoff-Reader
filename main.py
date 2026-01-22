@@ -346,7 +346,7 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
     if df.empty: return
     plot_df = df.copy()
     if "date" in plot_df.columns:
-        plot_df.date = plot_df.to_datetime[plot_df["date"]]
+        plot_df.date = pd.to_datetime[plot_df["date"]]
         plot_df.set_index("date", inplace=True)
 
     mc = mpf.make_marketcolors(up='#ff3333', down='#00b060', edge='inherit', wick='inherit', volume={'up': '#ff3333', 'down': '#00b060'}, inherit=True)
@@ -589,4 +589,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
