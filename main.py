@@ -473,17 +473,20 @@ def ai_analyze(symbol, df, position_info):
 
 def insert_soft_breaks(text):
     """
-    核心修复逻辑：
-    在每个中文字符后面插入一个“零宽空格” (\u200B)。
-    这会欺骗 xhtml2pdf 引擎，让它认为每个字都是一个可以换行的单词，
-    从而彻底解决中文长句不换行的问题，且不会影响视觉显示。
+    核心修复逻辑 (V2):
+    使用 Python 标准字符串来处理 Unicode，避免正则引擎报 "bad escape \u"。
     """
     import re
     if not text: return ""
-    # 匹配中日韩字符 (CJK) 范围
-    cjk_pattern = re.compile(r'([\u4e00-\u9fa5])')
-    # 替换为 "字符 + 零宽空格"
-    return cjk_pattern.sub(r'\1\u200B', text)
+    
+    # 修复 1: 去掉 r''，直接用标准字符串。
+    # Python 会先解释 \u4e00-\u9fa5 为实际的汉字字符，再传给 re，这样最安全。
+    cjk_pattern = re.compile('([\u4e00-\u9fa5])')
+    
+    # 修复 2: 替换字符串也分段处理。
+    # r'\1' 代表正则捕获的那个字，'\u200B' 是实际的零宽空格字符。
+    # 拼接起来传给 sub，完美避开转义歧义。
+    return cjk_pattern.sub(r'\1' + '\u200B', text)
 
 def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
     # 1. ✅ 预处理文本：注入零宽空格，强制允许换行
@@ -676,6 +679,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
