@@ -468,12 +468,29 @@ def ai_analyze(symbol, df, position_info):
 
 
 # ==========================================
-# 4. PDF 生成模块 (修复 Not a float 报错)
+# 4. PDF 生成模块 (修复中文不换行截断问题)
 # ==========================================
 
+def insert_soft_breaks(text):
+    """
+    核心修复逻辑：
+    在每个中文字符后面插入一个“零宽空格” (\u200B)。
+    这会欺骗 xhtml2pdf 引擎，让它认为每个字都是一个可以换行的单词，
+    从而彻底解决中文长句不换行的问题，且不会影响视觉显示。
+    """
+    import re
+    if not text: return ""
+    # 匹配中日韩字符 (CJK) 范围
+    cjk_pattern = re.compile(r'([\u4e00-\u9fa5])')
+    # 替换为 "字符 + 零宽空格"
+    return cjk_pattern.sub(r'\1\u200B', text)
+
 def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
-    # 1. 启用 'nl2br' 扩展
-    html_content = markdown.markdown(report_text, extensions=['nl2br'])
+    # 1. ✅ 预处理文本：注入零宽空格，强制允许换行
+    formatted_text = insert_soft_breaks(report_text)
+    
+    # 2. 转换 Markdown -> HTML
+    html_content = markdown.markdown(formatted_text, extensions=['nl2br'])
     
     abs_chart_path = os.path.abspath(chart_path)
     font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
@@ -488,7 +505,12 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
             
             @page {{
                 size: A4;
-                margin: 1cm; /* 缩小一点边距 */
+                /* ⚠️ 核心修复：加大右边距，给文字留出缓冲空间 */
+                margin-top: 1cm;
+                margin-bottom: 1cm;
+                margin-left: 1.5cm;
+                margin-right: 1.5cm;
+                
                 @frame footer_frame {{
                     -pdf-frame-content: footerContent;
                     bottom: 0cm;
@@ -500,23 +522,25 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
             
             body {{ 
                 font-family: "MyChineseFont", sans-serif; 
-                font-size: 12px; 
+                font-size: 11px; /* 字体稍微调小一点点，容纳更多内容 */
                 line-height: 1.5;
                 color: #2c3e50;
+                
+                /* ⚠️ 核心修复：配合零宽空格，强制换行 */
+                white-space: normal !important;
                 word-wrap: break-word;
-                word-break: break-all; 
+                text-align: left; /* 避免两端对齐导致的间距诡异 */
             }}
 
             h1, h2, h3 {{ 
                 color: #2c3e50; 
-                margin-top: 10px; 
-                margin-bottom: 5px;
+                margin-top: 12px; 
+                margin-bottom: 6px;
+                font-weight: bold;
             }}
 
-            /* ⚠️ 核心修复：xhtml2pdf 不支持 width: 90% */
             img {{ 
-                /* width: 90%;  <-- 这一行导致了报错，删掉 */
-                zoom: 55%;      /* 改用 zoom 缩放，或者用 width: 15cm; */
+                zoom: 55%; 
                 margin: 10px auto; 
                 display: block;
             }}
@@ -525,8 +549,7 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
                 text-align: center; 
                 margin-bottom: 10px; 
                 color: #7f8c8d; 
-                font-size: 14px; 
-                font-weight: bold;
+                font-size: 12px; 
                 border-bottom: 1px solid #eee;
                 padding-bottom: 5px;
             }}
@@ -535,11 +558,12 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
             li {{ margin-bottom: 3px; }}
             
             blockquote {{
-                background: #f9f9f9;
-                border-left: 3px solid #ccc;
+                background: #f8f9fa;
+                border-left: 3px solid #17a2b8;
                 margin: 5px 0;
-                padding: 5px;
+                padding: 8px;
                 color: #555;
+                font-size: 10px;
             }}
         </style>
     </head>
@@ -552,11 +576,11 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
         
         <hr style="border: 0; border-top: 1px solid #eee; margin: 10px 0;"/>
         
-        <div>
+        <div style="width: 100%;">
             {html_content}
         </div>
         
-        <div id="footerContent" style="text-align:center; font-size: 10px; color: gray;">
+        <div id="footerContent" style="text-align:center; font-size: 9px; color: gray;">
             Page <pdf:pagenumber>
         </div>
     </body>
@@ -652,6 +676,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
