@@ -468,30 +468,44 @@ def ai_analyze(symbol, df, position_info):
 
 
 # ==========================================
-# 4. PDF 生成模块 (核心修复：Unicode安全)
+# 4. PDF 生成模块 (核心修复：CJK 自动换行 + 长串断行)
 # ==========================================
 
-def insert_soft_breaks(text):
+def insert_soft_breaks(text: str) -> str:
     """
-    使用 chr(0x200B) 避免直接在源码中写 \u200B 导致的编码错误。
-    chr(0x4e00) 和 chr(0x9fa5) 对应中文 Unicode 范围。
+    目标：为 xhtml2pdf/ReportLab 提供稳定的断行点，避免中文段落/长串被裁切不显示。
+    使用 chr(0x200B) 插入零宽空格，避免 Python 源码编码报错。
     """
-    if not text: return ""
-    
-    # 使用 chr() 构造正则范围，绝对安全
-    pattern_str = f'([{chr(0x4e00)}-{chr(0x9fa5)}])'
-    cjk_pattern = re.compile(pattern_str)
-    
-    # 替换为 "字符 + 零宽空格(0x200B)"
-    return cjk_pattern.sub(r'\1' + chr(0x200B), text)
+    if not text:
+        return ""
 
-def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
-    # 1. 预处理文本：注入零宽空格
+    zwsp = chr(0x200B)
+
+    # 1) 中文字符后插入断行点
+    # 使用 chr() 动态生成正则范围，避免 \u syntax error
+    pattern_str = f'([{chr(0x4e00)}-{chr(0x9fa5)}])'
+    text = re.sub(pattern_str, r'\1' + zwsp, text)
+
+    # 2) 常见分隔符后插入断行点（URL/路径/表达式）
+    text = re.sub(r'([\/\_\-\.\=\:\?\&\#\%])', r'\1' + zwsp, text)
+
+    # 3) 超长连续英文数字串：每 25 个字符插一次断行点
+    def _break_long_token(m: re.Match) -> str:
+        s = m.group(0)
+        step = 25
+        return zwsp.join(s[i:i + step] for i in range(0, len(s), step))
+
+    text = re.sub(r'[A-Za-z0-9]{40,}', _break_long_token, text)
+
+    return text
+
+def generate_pdf_report(symbol: str, chart_path: str, report_text: str, pdf_path: str) -> bool:
+    # 1) 预处理文本：注入断行点
     formatted_text = insert_soft_breaks(report_text)
-    
-    # 2. 转换 Markdown -> HTML
-    html_content = markdown.markdown(formatted_text, extensions=['nl2br'])
-    
+
+    # 2) Markdown -> HTML
+    html_content = markdown.markdown(formatted_text, extensions=["nl2br"])
+
     abs_chart_path = os.path.abspath(chart_path)
     font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
     if not os.path.exists(font_path): font_path = "msyh.ttc"
@@ -501,15 +515,18 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
     <head>
         <meta charset="utf-8">
         <style>
-            @font-face {{ font-family: "MyChineseFont"; src: url("{font_path}"); }}
-            
+            @font-face {{
+                font-family: "MyChineseFont";
+                src: url("{font_path}");
+            }}
+
             @page {{
                 size: A4;
                 margin-top: 1cm;
                 margin-bottom: 1cm;
                 margin-left: 1.5cm;
                 margin-right: 1.5cm;
-                
+
                 @frame footer_frame {{
                     -pdf-frame-content: footerContent;
                     bottom: 0cm;
@@ -518,42 +535,60 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
                     height: 1cm;
                 }}
             }}
-            
-            body {{ 
-                font-family: "MyChineseFont", sans-serif; 
+
+            body {{
+                font-family: "MyChineseFont", sans-serif;
                 font-size: 11px;
                 line-height: 1.5;
                 color: #2c3e50;
+                text-align: left;
+                
+                /* 关键修复：xhtml2pdf 的 CJK 自动断行开关 */
+                -pdf-word-wrap: CJK;
+                
+                /* 浏览器兼容样式 */
                 white-space: normal !important;
                 word-wrap: break-word;
-                text-align: left;
+                overflow-wrap: anywhere;
+                word-break: break-all;
             }}
 
-            h1, h2, h3 {{ 
-                color: #2c3e50; 
-                margin-top: 12px; 
+            /* 兜底：段落/列表/引用容器都启用 CJK 断行 */
+            p, div, li, blockquote {{
+                -pdf-word-wrap: CJK;
+            }}
+
+            h1, h2, h3 {{
+                color: #2c3e50;
+                margin-top: 12px;
                 margin-bottom: 6px;
                 font-weight: bold;
             }}
 
-            img {{ 
-                zoom: 55%; 
-                margin: 10px auto; 
+            img {{
+                zoom: 55%;
+                margin: 10px auto;
                 display: block;
             }}
 
-            .header {{ 
-                text-align: center; 
-                margin-bottom: 10px; 
-                color: #7f8c8d; 
-                font-size: 12px; 
+            .header {{
+                text-align: center;
+                margin-bottom: 10px;
+                color: #7f8c8d;
+                font-size: 12px;
                 border-bottom: 1px solid #eee;
                 padding-bottom: 5px;
             }}
-            
-            ul, ol {{ margin-left: 15px; padding-left: 0; }}
-            li {{ margin-bottom: 3px; }}
-            
+
+            ul, ol {{
+                margin-left: 15px;
+                padding-left: 0;
+            }}
+
+            li {{
+                margin-bottom: 3px;
+            }}
+
             blockquote {{
                 background: #f8f9fa;
                 border-left: 3px solid #17a2b8;
@@ -562,29 +597,38 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
                 color: #555;
                 font-size: 10px;
             }}
+
+            /* Markdown 代码块溢出修复 */
+            pre, code {{
+                white-space: pre-wrap;
+                -pdf-word-wrap: CJK;
+                word-wrap: break-word;
+            }}
         </style>
     </head>
     <body>
         <div class="header">Wyckoff Quantitative Analysis | {symbol}</div>
-        
+
         <div style="text-align: center;">
             <img src="{abs_chart_path}" />
         </div>
-        
+
         <hr style="border: 0; border-top: 1px solid #eee; margin: 10px 0;"/>
-        
+
         <div style="width: 100%;">
             {html_content}
         </div>
-        
+
         <div id="footerContent" style="text-align:center; font-size: 9px; color: gray;">
             Page <pdf:pagenumber>
         </div>
     </body>
     </html>
     """
+
     try:
-        with open(pdf_path, "wb") as pdf_file: pisa.CreatePDF(full_html, dest=pdf_file)
+        with open(pdf_path, "wb") as pdf_file:
+            pisa.CreatePDF(full_html, dest=pdf_file)
         return True
     except Exception as e:
         print(f"   ❌ PDF 生成失败: {e}", flush=True)
@@ -673,6 +717,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
