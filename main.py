@@ -468,33 +468,107 @@ def ai_analyze(symbol, df, position_info):
 
 
 # ==========================================
-# 4. PDF 生成模块
+# 4. PDF 生成模块 (修复文字截断问题)
 # ==========================================
 
 def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
-    html_content = markdown.markdown(report_text)
+    # 1. 启用 'nl2br' 扩展，确保 Markdown 里的换行符能正确转换成 HTML <br>
+    html_content = markdown.markdown(report_text, extensions=['nl2br'])
+    
     abs_chart_path = os.path.abspath(chart_path)
     font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
     if not os.path.exists(font_path): font_path = "msyh.ttc"
 
+    # 2. 核心 CSS 修复：
+    # - word-break: break-all; -> 强制中文换行
+    # - white-space: pre-wrap; -> 保留格式
+    # - page-break-inside: auto; -> 允许跨页
     full_html = f"""
     <html>
     <head>
         <meta charset="utf-8">
         <style>
             @font-face {{ font-family: "MyChineseFont"; src: url("{font_path}"); }}
-            @page {{ size: A4; margin: 1cm; }}
-            body {{ font-family: "MyChineseFont", sans-serif; font-size: 12px; line-height: 1.5; }}
-            h1, h2, h3, p, div {{ font-family: "MyChineseFont", sans-serif; color: #2c3e50; }}
-            img {{ width: 18cm; margin-bottom: 20px; }}
-            .header {{ text-align: center; margin-bottom: 20px; color: #7f8c8d; font-size: 10px; }}
+            
+            @page {{
+                size: A4;
+                margin: 1.5cm; /* 稍微加大页边距 */
+                @frame footer_frame {{           /* 页脚设置 */
+                    -pdf-frame-content: footerContent;
+                    bottom: 0cm;
+                    margin-left: 1cm;
+                    margin-right: 1cm;
+                    height: 1cm;
+                }}
+            }}
+            
+            body {{ 
+                font-family: "MyChineseFont", sans-serif; 
+                font-size: 12px; 
+                line-height: 1.6;
+                color: #2c3e50;
+                /* ⚠️ 核心修复：强制中文自动换行，防止跑出右边界 */
+                word-wrap: break-word;
+                word-break: break-all; 
+                text-align: justify;
+            }}
+
+            /* 优化标题显示 */
+            h1, h2, h3 {{ 
+                color: #2c3e50; 
+                margin-top: 15px; 
+                margin-bottom: 10px;
+                line-height: 1.4;
+            }}
+
+            /* 优化图片显示，防止过宽 */
+            img {{ 
+                width: 90%; 
+                height: auto;
+                margin: 20px auto; 
+                display: block;
+            }}
+
+            .header {{ 
+                text-align: center; 
+                margin-bottom: 20px; 
+                color: #7f8c8d; 
+                font-size: 14px; 
+                font-weight: bold;
+                border-bottom: 1px solid #eee;
+                padding-bottom: 10px;
+            }}
+            
+            /* 列表样式优化 */
+            ul, ol {{ margin-left: 20px; padding-left: 0; }}
+            li {{ margin-bottom: 5px; }}
+            
+            /* 代码块或引用样式 */
+            blockquote {{
+                background: #f9f9f9;
+                border-left: 4px solid #ccc;
+                margin: 10px 0;
+                padding: 5px 10px;
+                color: #555;
+            }}
         </style>
     </head>
     <body>
         <div class="header">Wyckoff Quantitative Analysis | {symbol}</div>
-        <img src="{abs_chart_path}" />
-        <hr/>
-        {html_content}
+        
+        <div style="text-align: center;">
+            <img src="{abs_chart_path}" />
+        </div>
+        
+        <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;"/>
+        
+        <div>
+            {html_content}
+        </div>
+        
+        <div id="footerContent" style="text-align:center; font-size: 10px; color: gray;">
+            Page <pdf:pagenumber>
+        </div>
     </body>
     </html>
     """
@@ -502,7 +576,6 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
         with open(pdf_path, "wb") as pdf_file: pisa.CreatePDF(full_html, dest=pdf_file)
         return True
     except: return False
-
 
 # ==========================================
 # 5. 主程序 (串行 + 30s 休息)
@@ -587,4 +660,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
