@@ -468,28 +468,25 @@ def ai_analyze(symbol, df, position_info):
 
 
 # ==========================================
-# 4. PDF 生成模块 (修复中文不换行截断问题)
+# 4. PDF 生成模块 (核心修复：Unicode安全)
 # ==========================================
 
 def insert_soft_breaks(text):
     """
-    核心修复逻辑 (V2):
-    使用 Python 标准字符串来处理 Unicode，避免正则引擎报 "bad escape \u"。
+    使用 chr(0x200B) 避免直接在源码中写 \u200B 导致的编码错误。
+    chr(0x4e00) 和 chr(0x9fa5) 对应中文 Unicode 范围。
     """
-    import re
     if not text: return ""
     
-    # 修复 1: 去掉 r''，直接用标准字符串。
-    # Python 会先解释 \u4e00-\u9fa5 为实际的汉字字符，再传给 re，这样最安全。
-    cjk_pattern = re.compile('([\u4e00-\u9fa5])')
+    # 使用 chr() 构造正则范围，绝对安全
+    pattern_str = f'([{chr(0x4e00)}-{chr(0x9fa5)}])'
+    cjk_pattern = re.compile(pattern_str)
     
-    # 修复 2: 替换字符串也分段处理。
-    # r'\1' 代表正则捕获的那个字，'\u200B' 是实际的零宽空格字符。
-    # 拼接起来传给 sub，完美避开转义歧义。
-    return cjk_pattern.sub(r'\1' + '\u200B', text)
+    # 替换为 "字符 + 零宽空格(0x200B)"
+    return cjk_pattern.sub(r'\1' + chr(0x200B), text)
 
 def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
-    # 1. ✅ 预处理文本：注入零宽空格，强制允许换行
+    # 1. 预处理文本：注入零宽空格
     formatted_text = insert_soft_breaks(report_text)
     
     # 2. 转换 Markdown -> HTML
@@ -508,7 +505,6 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
             
             @page {{
                 size: A4;
-                /* ⚠️ 核心修复：加大右边距，给文字留出缓冲空间 */
                 margin-top: 1cm;
                 margin-bottom: 1cm;
                 margin-left: 1.5cm;
@@ -525,14 +521,12 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
             
             body {{ 
                 font-family: "MyChineseFont", sans-serif; 
-                font-size: 11px; /* 字体稍微调小一点点，容纳更多内容 */
+                font-size: 11px;
                 line-height: 1.5;
                 color: #2c3e50;
-                
-                /* ⚠️ 核心修复：配合零宽空格，强制换行 */
                 white-space: normal !important;
                 word-wrap: break-word;
-                text-align: left; /* 避免两端对齐导致的间距诡异 */
+                text-align: left;
             }}
 
             h1, h2, h3 {{ 
@@ -679,6 +673,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
