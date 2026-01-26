@@ -87,7 +87,6 @@ def call_gemini_http(prompt: str) -> str:
         "safetySettings": safety_settings,
     }
 
-    # ⚠️ 默认重试次数
     max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "1"))
     base_sleep = float(os.getenv("GEMINI_BASE_SLEEP", "3.0"))
     timeout_s = int(os.getenv("GEMINI_TIMEOUT", "120"))
@@ -119,13 +118,13 @@ def call_gemini_http(prompt: str) -> str:
                 if attempt == max_retries:
                     raise GeminiRateLimited(resp.text[:200])
 
-                print(f"   ⚠️ Gemini 429限流，等待 {retry_s}s ({attempt}/{max_retries})", flush=True)
+                print(f"    ⚠️ Gemini 429限流，等待 {retry_s}s ({attempt}/{max_retries})", flush=True)
                 time.sleep(retry_s)
                 continue
 
             if resp.status_code == 503:
                 retry_s = int(base_sleep * (2 ** (attempt - 1)) + random.random())
-                print(f"   ⚠️ Gemini 503过载，等待 {retry_s}s ({attempt}/{max_retries})", flush=True)
+                print(f"    ⚠️ Gemini 503过载，等待 {retry_s}s ({attempt}/{max_retries})", flush=True)
                 time.sleep(retry_s)
                 continue
 
@@ -137,14 +136,14 @@ def call_gemini_http(prompt: str) -> str:
             last_err = e
             if attempt == max_retries: raise
             retry_s = int(base_sleep * (2 ** (attempt - 1)) + random.random())
-            print(f"   ⚠️ Gemini 异常: {str(e)[:100]}... 等待 {retry_s}s ({attempt}/{max_retries})", flush=True)
+            print(f"    ⚠️ Gemini 异常: {str(e)[:100]}... 等待 {retry_s}s ({attempt}/{max_retries})", flush=True)
             time.sleep(retry_s)
 
     raise last_err or Exception("Gemini Unknown Failure")
 
 
 # ==========================================
-# 1. 数据获取模块 (BaoStock+AkShare+1min支持)
+# 1. 数据获取模块 (稳定性增强：AkShare 重试 + 延迟)
 # ==========================================
 
 def _get_baostock_code(symbol: str) -> str:
@@ -154,53 +153,22 @@ def _get_baostock_code(symbol: str) -> str:
     return f"sz.{symbol}"
 
 def _detect_and_fix_volume_units(df_bs: pd.DataFrame, df_ak: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    智能修正 AkShare 的成交量单位（手 vs 股）。
-    策略：
-    1. 【单源 AkShare】使用统计学特征（整百率 mod100）判断。
-       - 如果成交量大部分能被100整除（mod100 > 0.9），认为是“股”。
-       - 如果大量出现非整百数（如53, 1, 5），认为是“手”，需 x100。
-    2. 【双源对比】使用 BaoStock vs AkShare 的重叠数据中位数比值。
-    """
-
-    # === A. 单源 AkShare 处理 (无 BaoStock 数据时) ===
     if df_bs.empty and not df_ak.empty:
-        # 1. 兜底：样本太少，统计学失效，默认按“手”处理（AkShare特性）
         v = df_ak["volume"].dropna()
         if len(v) < 50:
-            print(f"   ⚖️ (单源兜底) 样本不足({len(v)})，默认按“手”->“股”修正 (x100)", flush=True)
             df_ak = df_ak.copy()
             df_ak["volume"] *= 100
             return df_bs, df_ak
-
-        # 2. 统计学特征分析
-        # mod100: 能被100整除的比例。
-        # 如果是“股”，因为买卖通常是100股整数倍，这个比例会很高（>0.9）。
-        # 如果是“手”，会出现 1, 5, 53 等数字，这个比例会很低。
         mod100 = float((v % 100 == 0).mean())
-        med = float(v.median())
-
-        print(f"   🔎 (单源分析) AkShare vol_median={med:.0f}, 整百率(mod100)={mod100:.2%}", flush=True)
-
-        # 3. 决策逻辑
-        # 安全阀：如果 90% 以上的数据都能被100整除，说明很有可能已经是“股”了，千万别再乘！
         if mod100 > 0.9:
-            print(f"   ✅ (单源) 检测到整百率极高({mod100:.1%})，判断单位已为'股'，跳过修正", flush=True)
             return df_bs, df_ak
-        
-        # 否则，默认为“手”，执行修正
         df_ak = df_ak.copy()
         df_ak["volume"] *= 100
-        print(f"   ⚖️ (单源修正) 整百率低({mod100:.1%}) -> 判定为'手' -> 修正 (x100)", flush=True)
-
         return df_bs, df_ak
 
-    # === B. 双源缺失处理 ===
     if df_bs.empty or df_ak.empty:
         return df_bs, df_ak
 
-    # === C. 双源对比 (BaoStock vs AkShare) ===
-    # 取重叠区间进行对比
     a = df_bs[["date", "volume"]].dropna()
     b = df_ak[["date", "volume"]].dropna()
     m = a.merge(b, on="date", how="inner", suffixes=("_bs", "_ak"))
@@ -209,7 +177,7 @@ def _detect_and_fix_volume_units(df_bs: pd.DataFrame, df_ak: pd.DataFrame) -> tu
     if len(m) < 10: 
         return df_bs, df_ak
 
-    m = m.tail(200) # 只看最近
+    m = m.tail(200) 
     ratio_med = float((m["volume_bs"] / m["volume_ak"]).median())
 
     def _in(r, center, tol=0.25):
@@ -219,21 +187,13 @@ def _detect_and_fix_volume_units(df_bs: pd.DataFrame, df_ak: pd.DataFrame) -> tu
     df_bs = df_bs.copy()
 
     if _in(ratio_med, 1000):
-        print(f"   ⚖️ [双源修正] AkShare 单位 x1000 (Ratio={ratio_med:.1f})", flush=True)
         df_ak["volume"] *= 1000
     elif _in(ratio_med, 100):
-        print(f"   ⚖️ [双源修正] AkShare 单位 x100 (Ratio={ratio_med:.1f})", flush=True)
         df_ak["volume"] *= 100
     elif _in(ratio_med, 0.001):
-        print(f"   ⚖️ [双源修正] BaoStock 单位 x1000 (Ratio={ratio_med:.1f})", flush=True)
         df_bs["volume"] *= 1000
     elif _in(ratio_med, 0.01):
-        print(f"   ⚖️ [双源修正] BaoStock 单位 x100 (Ratio={ratio_med:.1f})", flush=True)
         df_bs["volume"] *= 100
-    else:
-        # 如果比例接近1，说明单位一致，无需操作
-        pass
-        
     return df_bs, df_ak
 
 def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str) -> dict:
@@ -247,7 +207,6 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
     except: limit = 500
 
     if tf_min not in [1, 5, 15, 30, 60]:
-        print(f"   ⚠️ 周期 {tf_min} 非标准(支持1/5/15/30/60)，调整为 60", flush=True)
         tf_min = 60
     
     total_minutes = limit * tf_min
@@ -258,7 +217,7 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
     start_date_ak_str = start_date_dt.strftime("%Y%m%d")
     
     source_msg = "AkShare Only" if tf_min == 1 else "BaoStock+AkShare"
-    print(f"   🔍 获取 {symbol_code}: 周期={tf_min}m, 目标={limit}根 ({source_msg})", flush=True)
+    print(f"    🔍 获取 {symbol_code}: 周期={tf_min}m, 目标={limit}根 ({source_msg})", flush=True)
 
     # === A. BaoStock 历史 ===
     df_bs = pd.DataFrame()
@@ -286,48 +245,58 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
                         df_bs = df_bs[["date", "open", "high", "low", "close", "volume"]]
             bs.logout()
         except Exception as e:
-            print(f"   [BaoStock] 异常: {e}", flush=True)
+            print(f"    [BaoStock] 异常: {e}", flush=True)
 
-    # === B. AkShare 数据 ===
+    # === B. AkShare 数据 (增加稳定性重试逻辑) ===
     ak_fetch_start = start_date_ak_str if tf_min == 1 else (datetime.now() - timedelta(days=20)).strftime("%Y%m%d")
-    
     df_ak = pd.DataFrame()
-    try:
-        df_ak = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period=str(tf_min), start_date=ak_fetch_start, adjust="qfq")
-        if not df_ak.empty:
-            rename_map = {
-                "时间": "date", "开盘": "open", "最高": "high", "最低": "low", 
-                "收盘": "close", "成交量": "volume"
-            }
-            df_ak = df_ak.rename(columns={k: v for k, v in rename_map.items() if k in df_ak.columns})
-            df_ak["date"] = pd.to_datetime(df_ak["date"], errors="coerce")
+    
+    max_ak_retries = 3
+    for ak_attempt in range(1, max_ak_retries + 1):
+        try:
+            # 1. 模拟人工：请求前随机微调 1-3 秒
+            time.sleep(random.uniform(1.0, 3.0))
             
-            cols = ["open", "high", "low", "close", "volume"]
-            for c in cols: df_ak[c] = pd.to_numeric(df_ak[c], errors="coerce")
+            df_temp = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period=str(tf_min), start_date=ak_fetch_start, adjust="qfq")
             
-            df_ak["open"] = df_ak["open"].replace(0, np.nan)
-            df_ak["open"] = df_ak["open"].fillna(df_ak["close"].shift(1)).fillna(df_ak["close"])
-            df_ak = df_ak.dropna(subset=["date", "close"])
-            df_ak = df_ak[["date", "open", "high", "low", "close", "volume"]]
-            
-    except Exception as e:
-        print(f"   [AkShare] 异常: {e}", flush=True)
+            if not df_temp.empty:
+                df_ak = df_temp
+                break # 成功则退出重试
+        except Exception as e:
+            err_msg = str(e)
+            if "RemoteDisconnected" in err_msg or "Connection aborted" in err_msg:
+                wait_s = ak_attempt * 5 + random.random()
+                print(f"    ⚠️ AkShare 连接中断 ({ak_attempt}/{max_ak_retries})，等待 {wait_s:.1f}s 重试...", flush=True)
+                time.sleep(wait_s)
+            else:
+                print(f"    [AkShare] 未知异常: {err_msg}", flush=True)
+                break
+
+    if not df_ak.empty:
+        rename_map = {
+            "时间": "date", "开盘": "open", "最高": "high", "最低": "low", 
+            "收盘": "close", "成交量": "volume"
+        }
+        df_ak = df_ak.rename(columns={k: v for k, v in rename_map.items() if k in df_ak.columns})
+        df_ak["date"] = pd.to_datetime(df_ak["date"], errors="coerce")
+        cols = ["open", "high", "low", "close", "volume"]
+        for c in cols: df_ak[c] = pd.to_numeric(df_ak[c], errors="coerce")
+        df_ak["open"] = df_ak["open"].replace(0, np.nan)
+        df_ak["open"] = df_ak["open"].fillna(df_ak["close"].shift(1)).fillna(df_ak["close"])
+        df_ak = df_ak.dropna(subset=["date", "close"])
+        df_ak = df_ak[["date", "open", "high", "low", "close", "volume"]]
 
     # === C. 合并与单位修正 ===
     if df_bs.empty and df_ak.empty:
         return {"df": pd.DataFrame(), "period": f"{tf_min}m"}
     
-    # 调用智能修正函数
     df_bs, df_ak = _detect_and_fix_volume_units(df_bs, df_ak)
-
     df_final = pd.concat([df_bs, df_ak], axis=0, ignore_index=True)
-    df_final = df_final[["date", "open", "high", "low", "close", "volume"]]
     df_final = df_final.drop_duplicates(subset=['date'], keep='last')
     df_final = df_final.sort_values(by='date').reset_index(drop=True)
     
     if len(df_final) > limit:
         df_final = df_final.tail(limit).reset_index(drop=True)
-
     return {"df": df_final, "period": f"{tf_min}m"}
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -336,7 +305,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df["ma50"] = df["close"].rolling(50).mean()
         df["ma200"] = df["close"].rolling(200).mean()
     return df
-
 
 # ==========================================
 # 2. 绘图模块
@@ -359,7 +327,7 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
                  savefig=dict(fname=save_path, dpi=150, bbox_inches='tight'), 
                  warn_too_much_data=2000)
     except Exception as e:
-        print(f"   [Error] 绘图失败: {e}", flush=True)
+        print(f"    [Error] 绘图失败: {e}", flush=True)
 
 
 # ==========================================
@@ -379,10 +347,8 @@ def get_prompt_content(symbol, df, position_info):
         _PROMPT_CACHE = prompt_template
 
     if not _PROMPT_CACHE: return None
-
     csv_data = df.to_csv(index=False)
     latest = df.iloc[-1]
-    
     period_str = position_info.get('timeframe', '5') + "m"
     
     base_prompt = (_PROMPT_CACHE
@@ -412,7 +378,6 @@ def get_prompt_content(symbol, df, position_info):
     return base_prompt + position_text
 
 def call_openai_official(prompt: str) -> str:
-    """第三优先级：OpenAI / DeepSeek (原版)"""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key: raise ValueError("OPENAI_API_KEY missing")
     model_name = os.getenv("AI_MODEL", "gpt-4o")
@@ -425,18 +390,11 @@ def call_openai_official(prompt: str) -> str:
     return resp.choices[0].message.content
 
 def call_custom_api(prompt: str) -> str:
-    """第二优先级：Qiandao Custom API"""
-    # 这里的 KEY 需要在 Github Secrets 里配置，例如 CUSTOM_API_KEY
-    # 如果没有配置，这里会报错，然后自动切到 OpenAI
     api_key = os.getenv("CUSTOM_API_KEY") 
-    if not api_key: 
-        raise ValueError("CUSTOM_API_KEY missing, skipping custom API")
-    
+    if not api_key: raise ValueError("CUSTOM_API_KEY missing")
     base_url = "https://api2.qiandao.mom/v1"
     model_name = "DeepSeek-V3.2-a"
-    
     client = OpenAI(api_key=api_key, base_url=base_url)
-    
     resp = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "system", "content": "You are Richard D. Wyckoff."}, {"role": "user", "content": prompt}],
@@ -447,34 +405,25 @@ def call_custom_api(prompt: str) -> str:
 def ai_analyze(symbol, df, position_info):
     prompt = get_prompt_content(symbol, df, position_info)
     if not prompt: return "Error: No Prompt"
-
-    # === Level 1: Google Official Gemini ===
     try:
         return call_gemini_http(prompt)
     except Exception as e1:
-        print(f"   ⚠️ Gemini Official 失败: {str(e1)[:100]} -> 切 Custom API", flush=True)
-        
-        # === Level 2: Custom API (Qiandao) ===
+        print(f"    ⚠️ Gemini Official 失败: {str(e1)[:100]} -> 切 Custom API", flush=True)
         try:
             return call_custom_api(prompt)
         except Exception as e2:
-            print(f"   ⚠️ Custom API 失败: {str(e2)[:100]} -> 切 OpenAI", flush=True)
-            
-            # === Level 3: OpenAI / DeepSeek ===
+            print(f"    ⚠️ Custom API 失败: {str(e2)[:100]} -> 切 OpenAI", flush=True)
             try:
                 return call_openai_official(prompt)
             except Exception as e3:
                 return f"Analysis Failed. All APIs down. Error: {e3}"
 
 # ==========================================
-# 4. PDF 生成模块 (回归极简版：保留原味排版 + 修复内核Bug)
+# 4. PDF 生成模块
 # ==========================================
 
 def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
-    # 1. 直接转换，保留 Markdown 原始的段落结构 (<p>标签)
-    #    extensions=['extra'] 能更好支持表格和列表，但不改变段落感
     html_content = markdown.markdown(report_text, extensions=['extra'])
-    
     abs_chart_path = os.path.abspath(chart_path)
     font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
     if not os.path.exists(font_path): font_path = "msyh.ttc" 
@@ -485,79 +434,30 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
         <meta charset="utf-8">
         <style>
             @font-face {{ font-family: "MyChineseFont"; src: url("{font_path}"); }}
-            
-            @page {{ 
-                size: A4; 
-                margin: 1.5cm; /*稍微加大一点边距，看着更舒服*/
-                @frame footer_frame {{
-                    -pdf-frame-content: footerContent;
-                    bottom: 0cm;
-                    margin-left: 1cm;
-                    margin-right: 1cm;
-                    height: 1cm;
-                }}
-            }}
-            
-            body {{ 
-                font-family: "MyChineseFont", sans-serif; 
-                font-size: 12px; 
-                line-height: 1.6; /* 行高1.6是阅读最舒适的比例 */
-                color: #2c3e50;
-                
-                /* ⚠️ 唯一增加的核心修复：保证中文到行尾自动换行，不影响段落间距 */
-                -pdf-word-wrap: CJK; 
-            }}
-            
-            /* 保持你喜欢的标题样式 */
-            h1, h2, h3 {{ font-family: "MyChineseFont", sans-serif; color: #2c3e50; margin-top: 20px; margin-bottom: 10px; }}
-            
-            /* 显式给段落一点点下边距，防止太挤，保持“段落感” */
+            @page {{ size: A4; margin: 1.5cm; @frame footer_frame {{ -pdf-frame-content: footerContent; bottom: 0cm; height: 1cm; }} }}
+            body {{ font-family: "MyChineseFont", sans-serif; font-size: 12px; line-height: 1.6; color: #2c3e50; -pdf-word-wrap: CJK; }}
+            h1, h2, h3 {{ color: #2c3e50; margin-top: 20px; }}
             p {{ margin-bottom: 10px; }}
-            
-            img {{ 
-                zoom: 55%; /* 用zoom比width更兼容，防止图片变形 */
-                margin: 20px auto; 
-                display: block; 
-            }}
-            
-            .header {{ text-align: center; margin-bottom: 20px; color: #7f8c8d; font-size: 10px; }}
-            
-            /* 代码块防溢出 */
-            pre, code {{
-                white-space: pre-wrap;
-                word-wrap: break-word;
-                -pdf-word-wrap: CJK;
-                background: #f5f5f5;
-            }}
+            img {{ zoom: 55%; margin: 20px auto; display: block; }}
+            .header {{ text-align: center; color: #7f8c8d; font-size: 10px; }}
         </style>
     </head>
     <body>
         <div class="header">Wyckoff Quantitative Analysis | {symbol}</div>
-        
-        <div style="text-align: center;">
-            <img src="{abs_chart_path}" />
-        </div>
-        
+        <div style="text-align: center;"><img src="{abs_chart_path}" /></div>
         <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;"/>
-        
         {html_content}
-        
-        <div id="footerContent" style="text-align:center; font-size: 9px; color: gray;">
-            Page <pdf:pagenumber>
-        </div>
+        <div id="footerContent" style="text-align:center; font-size: 9px; color: gray;">Page <pdf:pagenumber></div>
     </body>
     </html>
     """
     try:
-        # ✅ 核心修复：这里必须 encode，否则必报错
         with open(pdf_path, "wb") as pdf_file:
             pisa.CreatePDF(src=full_html.encode("utf-8"), dest=pdf_file)
         return True
     except Exception as e:
-        print(f"   ❌ PDF 生成失败: {e}", flush=True)
+        print(f"    ❌ PDF 生成失败: {e}", flush=True)
         return False
-
-
 
 
 # ==========================================
@@ -568,28 +468,21 @@ def process_one_stock(symbol: str, position_info: dict):
     if position_info is None: position_info = {}
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     clean_symbol = clean_digits.zfill(6)
-
     tf_str = position_info.get("timeframe", "5")
     bars_str = position_info.get("bars", "500")
 
     print(f"🚀 [{clean_symbol}] 开始分析 (TF:{tf_str}m, Bars:{bars_str})...", flush=True)
-
     data_res = fetch_stock_data_dynamic(clean_symbol, tf_str, bars_str)
-    
     df = data_res["df"]
     period = data_res["period"]
 
     if df.empty:
-        print(f"   ⚠️ [{clean_symbol}] 数据为空，跳过", flush=True)
+        print(f"    ⚠️ [{clean_symbol}] 数据为空，跳过", flush=True)
         return None
 
     df = add_indicators(df)
-
     beijing_tz = timezone(timedelta(hours=8))
     ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S")
-
-    csv_path = f"data/{clean_symbol}_{period}_{ts}.csv"
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     chart_path = f"reports/{clean_symbol}_chart_{ts}.png"
     pdf_path = f"reports/{clean_symbol}_report_{period}_{ts}.pdf"
@@ -600,13 +493,11 @@ def process_one_stock(symbol: str, position_info: dict):
     if generate_pdf_report(clean_symbol, chart_path, report_text, pdf_path):
         print(f"✅ [{clean_symbol}] 报告生成完毕", flush=True)
         return pdf_path
-
     return None
 
 def main():
     os.makedirs("data", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
-
     print("☁️ 正在连接 Google Sheets...", flush=True)
     try:
         sm = SheetManager()
@@ -618,39 +509,22 @@ def main():
 
     generated_pdfs = []
     items = list(stocks_dict.items())
-
     for i, (symbol, info) in enumerate(items):
         try:
             pdf_path = process_one_stock(symbol, info)
-            if pdf_path:
-                generated_pdfs.append(pdf_path)
+            if pdf_path: generated_pdfs.append(pdf_path)
         except Exception as e:
             print(f"❌ [{symbol}] 处理发生异常: {e}", flush=True)
 
-        # ⚠️ 强制冷却 30 秒
         if i < len(items) - 1:
             print("⏳ 强制冷却 30秒...", flush=True)
             time.sleep(30)
 
     if generated_pdfs:
-        print(f"\n📝 生成推送清单 ({len(generated_pdfs)}):", flush=True)
         with open("push_list.txt", "w", encoding="utf-8") as f:
-            for pdf in generated_pdfs:
-                print(f"   -> {pdf}")
-                f.write(f"{pdf}\n")
+            for pdf in generated_pdfs: f.write(f"{pdf}\n")
     else:
         print("\n⚠️ 无报告生成", flush=True)
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
