@@ -80,6 +80,8 @@ jobs:
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
         run: |
           mkdir -p data reports
+          # 防止 checkout 出来仓库里残留的旧 push_list 导致“非交易日重复推送旧报告”
+          rm -f push_list.txt
           python main.py
 
       - name: Cleanup old data
@@ -109,7 +111,7 @@ jobs:
         shell: bash
         run: |
           set -u
-          if [ ! -f push_list.txt ]; then
+          if [ ! -s push_list.txt ]; then
             echo "::warning::File push_list.txt not found."
             exit 0
           fi
