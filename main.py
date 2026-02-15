@@ -18,6 +18,265 @@ import re
 from typing import Optional
 
 # ==========================================
+# Beijing timezone + A-share schedule helpers
+# ==========================================
+
+_BJ_TZ = timezone(timedelta(hours=8))
+
+def _bj_now() -> datetime:
+    return datetime.now(_BJ_TZ)
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    if v == "":
+        return default
+    return v in ("1", "true", "yes", "y", "on")
+
+def _parse_hhmm_list(value: str) -> list[str]:
+    if not value:
+        return []
+    out: list[str] = []
+    for part in value.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        p = re.sub(r"[^\d]", "", p)
+        if len(p) == 3:  # e.g. 940 -> 0940
+            p = "0" + p
+        if len(p) != 4:
+            continue
+        out.append(p)
+    return out
+
+def _hhmm_to_time(hhmm: str) -> tuple[int, int]:
+    return int(hhmm[:2]), int(hhmm[2:])
+
+def _trade_calendar_cache_path() -> str:
+    os.makedirs("data", exist_ok=True)
+    return os.path.join("data", "trade_calendar_sina.csv")
+
+def _load_trade_calendar() -> set[str]:
+    """
+    Returns trading days as 'YYYY-MM-DD' strings.
+    Tries cached file first; otherwise queries AkShare and writes cache.
+    """
+    cache_path = _trade_calendar_cache_path()
+    # Cache TTL: 7 days
+    try:
+        if os.path.exists(cache_path):
+            mtime = datetime.fromtimestamp(os.path.getmtime(cache_path), _BJ_TZ)
+            if (_bj_now() - mtime) < timedelta(days=7):
+                df = pd.read_csv(cache_path)
+                col = "date" if "date" in df.columns else (df.columns[0] if len(df.columns) else None)
+                if col:
+                    return set(str(x)[:10] for x in df[col].dropna().astype(str).tolist())
+    except Exception:
+        pass
+
+    try:
+        cal = ak.tool_trade_date_hist_sina()
+        for c in ("trade_date", "日期", "date"):
+            if c in cal.columns:
+                col = c
+                break
+        else:
+            col = cal.columns[0]
+
+        dates: list[str] = []
+        for v in cal[col].dropna().astype(str).tolist():
+            v = v.strip()
+            if re.fullmatch(r"\d{8}", v):
+                dates.append(f"{v[0:4]}-{v[4:6]}-{v[6:8]}")
+            else:
+                dates.append(v[:10])
+
+        out = sorted(set(dates))
+        try:
+            pd.DataFrame({"date": out}).to_csv(cache_path, index=False)
+        except Exception:
+            pass
+        return set(out)
+    except Exception as e:
+        # Worst-case fallback: weekday heuristic (may run on holidays)
+        print(f"    ⚠️ 交易日历获取失败，退化为工作日判断: {e}", flush=True)
+        return set()
+
+def _is_trade_day(d: datetime.date, trade_days: set[str]) -> bool:
+    s = d.strftime("%Y-%m-%d")
+    if trade_days:
+        return s in trade_days
+    return d.weekday() < 5
+
+def _last_completed_bar_end(now_bj: datetime, tf_min: int, trade_days: set[str]) -> datetime:
+    """
+    Approximate last completed bar end time (Beijing). For our push times (11:40, 15:20) this is enough.
+    """
+    if not _is_trade_day(now_bj.date(), trade_days):
+        return now_bj.replace(hour=15, minute=0, second=0, microsecond=0)
+
+    m_open = now_bj.replace(hour=9, minute=30, second=0, microsecond=0)
+    m_close = now_bj.replace(hour=11, minute=30, second=0, microsecond=0)
+    a_open = now_bj.replace(hour=13, minute=0, second=0, microsecond=0)
+    a_close = now_bj.replace(hour=15, minute=0, second=0, microsecond=0)
+
+    if now_bj < m_open:
+        return a_close
+    if m_open <= now_bj <= m_close:
+        minutes = int((now_bj - m_open).total_seconds() // 60)
+        end_min = (minutes // tf_min) * tf_min
+        return m_open + timedelta(minutes=end_min)
+    if m_close < now_bj < a_open:
+        return m_close
+    if a_open <= now_bj <= a_close:
+        minutes = int((now_bj - a_open).total_seconds() // 60)
+        end_min = (minutes // tf_min) * tf_min
+        return a_open + timedelta(minutes=end_min)
+    return a_close
+
+def _trim_future_rows(df: pd.DataFrame, now_bj: datetime) -> pd.DataFrame:
+    if df.empty or "date" not in df.columns:
+        return df
+    out = df.copy()
+    out = out[out["date"].notna()]
+    cutoff = now_bj.replace(tzinfo=None)
+    return out[out["date"] <= cutoff]
+
+def _refresh_akshare_recent(symbol_code: str, tf_min: int, start_days_back: int = 7) -> pd.DataFrame:
+    start = (_bj_now() - timedelta(days=start_days_back)).strftime("%Y%m%d")
+    df_ak = pd.DataFrame()
+    max_ak_retries = 3
+    for ak_attempt in range(1, max_ak_retries + 1):
+        try:
+            time.sleep(random.uniform(1.0, 3.0))
+            df_temp = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period=str(tf_min), start_date=start, adjust="qfq")
+            if not df_temp.empty:
+                df_ak = df_temp
+                break
+        except Exception as e:
+            wait_s = ak_attempt * 5 + random.random()
+            print(f"    ⚠️ AkShare 补拉失败 ({ak_attempt}/{max_ak_retries}): {str(e)[:120]} 等待 {wait_s:.1f}s", flush=True)
+            time.sleep(wait_s)
+
+    if df_ak.empty:
+        return df_ak
+
+    rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
+    df_ak = df_ak.rename(columns={k: v for k, v in rename_map.items() if k in df_ak.columns})
+    df_ak["date"] = pd.to_datetime(df_ak["date"], errors="coerce")
+    for c in ("open", "high", "low", "close", "volume"):
+        if c in df_ak.columns:
+            df_ak[c] = pd.to_numeric(df_ak[c], errors="coerce")
+    if "open" in df_ak.columns and "close" in df_ak.columns:
+        df_ak["open"] = df_ak["open"].replace(0, np.nan)
+        df_ak["open"] = df_ak["open"].fillna(df_ak["close"].shift(1)).fillna(df_ak["close"])
+    df_ak = df_ak.dropna(subset=["date", "close"])
+    return df_ak[["date", "open", "high", "low", "close", "volume"]]
+
+def _ensure_latest_data(symbol_code: str, tf_min: int, limit: int, df_final: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validates freshness and tries to refresh recent data via AkShare if stale.
+    If REQUIRE_FRESH_DATA=1 (default), stale data that can't be refreshed will be skipped.
+    """
+    if df_final.empty:
+        return df_final
+
+    trade_days = _load_trade_calendar()
+    now_bj = _bj_now()
+    if not _is_trade_day(now_bj.date(), trade_days):
+        return df_final
+
+    df_final = _trim_future_rows(df_final, now_bj)
+    if df_final.empty:
+        return df_final
+
+    expected = _last_completed_bar_end(now_bj, tf_min, trade_days).replace(tzinfo=None)
+    last_ts = pd.to_datetime(df_final["date"].max(), errors="coerce")
+    if pd.isna(last_ts):
+        return df_final
+
+    lag_min = int((expected - last_ts).total_seconds() // 60)
+    tol_min = max(7, tf_min * 2)
+    if lag_min <= tol_min:
+        return df_final
+
+    print(f"    ⚠️ 数据可能不够新: last={last_ts} expected~={expected} (lag={lag_min}m). 尝试 AkShare 补拉...", flush=True)
+    df_recent = _refresh_akshare_recent(symbol_code, tf_min, start_days_back=7)
+    if df_recent.empty:
+        return df_final
+
+    df_merged = pd.concat([df_final, df_recent], axis=0, ignore_index=True)
+    df_merged = df_merged.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+    df_merged = _trim_future_rows(df_merged, now_bj)
+    if len(df_merged) > limit:
+        df_merged = df_merged.tail(limit).reset_index(drop=True)
+
+    last_ts2 = pd.to_datetime(df_merged["date"].max(), errors="coerce")
+    lag_min2 = int((expected - last_ts2).total_seconds() // 60) if not pd.isna(last_ts2) else 10**9
+    if lag_min2 > tol_min and _parse_bool_env("REQUIRE_FRESH_DATA", True):
+        print(f"    ❌ 补拉后仍不新鲜: last={last_ts2} expected~={expected} (lag={lag_min2}m). 跳过该股票避免误判。", flush=True)
+        return pd.DataFrame()
+    return df_merged
+
+def _run_state_path() -> str:
+    os.makedirs("data", exist_ok=True)
+    return os.path.join("data", "run_state.json")
+
+def _load_run_state() -> dict:
+    p = _run_state_path()
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+def _save_run_state(state: dict) -> None:
+    p = _run_state_path()
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _schedule_gate() -> str | None:
+    """
+    Returns active slot (HHMM) if we should run now; otherwise returns None (exit early).
+    Uses ENFORCE_A_SHARE_SCHEDULE, A_SHARE_PUSH_SLOTS, A_SHARE_SLOT_LAG_MINUTES.
+    """
+    if not _parse_bool_env("ENFORCE_A_SHARE_SCHEDULE", False):
+        return "manual"
+
+    now_bj = _bj_now()
+    trade_days = _load_trade_calendar()
+    if not _is_trade_day(now_bj.date(), trade_days):
+        print(f"⏭️ 非交易日 {now_bj.date()}，跳过运行。", flush=True)
+        return None
+
+    slots = _parse_hhmm_list(os.getenv("A_SHARE_PUSH_SLOTS", "1140,1520"))
+    if not slots:
+        return "manual"
+
+    lag_allow = int(os.getenv("A_SHARE_SLOT_LAG_MINUTES", "20"))
+    state = _load_run_state()
+    day_key = now_bj.strftime("%Y-%m-%d")
+
+    for hhmm in slots:
+        hh, mm = _hhmm_to_time(hhmm)
+        slot_dt = now_bj.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if now_bj < slot_dt:
+            continue
+        if now_bj > (slot_dt + timedelta(minutes=lag_allow)):
+            continue
+        if str(state.get(day_key, {}).get(hhmm, "")):
+            print(f"⏭️ 今日 {day_key} 的 {hhmm} 已运行过，跳过。", flush=True)
+            return None
+        return hhmm
+
+    print(f"⏭️ 不在目标时间窗内（北京 {now_bj.strftime('%H:%M:%S')}），跳过。", flush=True)
+    return None
+
+# ==========================================
 # 0) Gemini 稳定性增强：429 退避 + 致命错误熔断 + 防断连
 # ==========================================
 
@@ -297,6 +556,8 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
     
     if len(df_final) > limit:
         df_final = df_final.tail(limit).reset_index(drop=True)
+    # 校验是否为最新数据；若落后则尝试 AkShare 补拉最近几天再合并
+    df_final = _ensure_latest_data(symbol_code, tf_min, limit, df_final)
     return {"df": df_final, "period": f"{tf_min}m"}
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -492,6 +753,9 @@ def process_one_stock(symbol: str, position_info: dict):
 def main():
     os.makedirs("data", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
+    active_slot = _schedule_gate()
+    if not active_slot:
+        return
     print("☁️ 正在连接 Google Sheets...", flush=True)
     try:
         sm = SheetManager()
@@ -519,6 +783,14 @@ def main():
             for pdf in generated_pdfs: f.write(f"{pdf}\n")
     else:
         print("\n⚠️ 无报告生成", flush=True)
+
+    # 记录本次时间窗已执行（用于高频 schedule 去重）
+    if active_slot and active_slot != "manual":
+        state = _load_run_state()
+        day_key = _bj_now().strftime("%Y-%m-%d")
+        state.setdefault(day_key, {})
+        state[day_key][active_slot] = _bj_now().isoformat()
+        _save_run_state(state)
 
 if __name__ == "__main__":
     main()
