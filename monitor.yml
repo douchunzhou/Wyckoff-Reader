@@ -1,0 +1,40 @@
+name: Monitor Telegram for New Stocks
+
+on:
+  workflow_dispatch:      # 允许手动触发
+  schedule:
+    # 1. 北京时间 07:00 - 07:30 (对应 UTC 前一天的 23:00 - 23:30)
+    - cron: "*/30 23 * * *"
+    
+    # 2. 北京时间 08:00 - 17:30 (对应 UTC 当天的 00:00 - 09:30)
+    - cron: "*/30 0-9 * * *"
+
+concurrency:
+  group: stock-monitor
+  cancel-in-progress: true
+
+jobs:
+  update-list:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        # 必须安装 gspread oauth2client 用于连接 Google Sheets
+        run: pip install requests gspread oauth2client
+
+      - name: Process Telegram Messages
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # Google Sheets 认证配置
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          SHEET_NAME: ${{ secrets.SHEET_NAME }}
+        run: |
+          python add_stock.py
