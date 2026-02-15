@@ -81,7 +81,7 @@ jobs:
         run: |
           mkdir -p data reports
           # 防止 checkout 出来仓库里残留的旧 push_list 导致“非交易日重复推送旧报告”
-          rm -f push_list.txt
+          rm -f push_list.txt run_status.txt
           python main.py
 
       - name: Cleanup old data
@@ -90,21 +90,39 @@ jobs:
           find reports/ -name "*.*" -type f -mtime +7 -print -delete
           find data/ -name "*.csv" -type f -mtime +7 -print -delete
 
-      - name: Commit and push changes
+      # 不再推送生成文件到仓库；仅通过 Telegram 通知运行情况/报告
+
+      - name: Detect Reports
+        id: detect_reports
+        if: always()
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add --all
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
+          if [ -s push_list.txt ]; then
+            echo "has_reports=true" >> "$GITHUB_OUTPUT"
           else
-            git commit -m "chore: daily report $(date +'%Y-%m-%d')"
-            git pull --rebase origin main
-            git push origin HEAD:main
+            echo "has_reports=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Notify Telegram (Status)
+        if: always() && steps.detect_reports.outputs.has_reports != 'true'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEXT=""
+          if [ -f run_status.txt ]; then
+            TEXT="$(cat run_status.txt | head -c 3500)"
+          else
+            TEXT="[${GITHUB_WORKFLOW}] run=${GITHUB_RUN_ID} status: (no run_status.txt)"
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+               -d "chat_id=${TG_CHAT_ID}" \
+               --data-urlencode "text=${TEXT}"
+
       - name: Notify Telegram (Push List)
-        if: success()
+        if: success() && steps.detect_reports.outputs.has_reports == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
