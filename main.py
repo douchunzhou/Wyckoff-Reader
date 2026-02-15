@@ -26,6 +26,22 @@ _BJ_TZ = timezone(timedelta(hours=8))
 def _bj_now() -> datetime:
     return datetime.now(_BJ_TZ)
 
+class StaleDataError(Exception):
+    pass
+
+def _run_status_path() -> str:
+    return "run_status.txt"
+
+def _write_run_status(text: str) -> None:
+    # Best-effort status file for CI notifications (e.g. Telegram).
+    try:
+        ts = _bj_now().strftime("%Y-%m-%d %H:%M:%S %Z")
+        msg = f"[{ts}] {text.strip()}\n"
+        with open(_run_status_path(), "w", encoding="utf-8") as f:
+            f.write(msg)
+    except Exception:
+        pass
+
 def _parse_bool_env(name: str, default: bool = False) -> bool:
     v = (os.getenv(name) or "").strip().lower()
     if v == "":
@@ -213,8 +229,9 @@ def _ensure_latest_data(symbol_code: str, tf_min: int, limit: int, df_final: pd.
     last_ts2 = pd.to_datetime(df_merged["date"].max(), errors="coerce")
     lag_min2 = int((expected - last_ts2).total_seconds() // 60) if not pd.isna(last_ts2) else 10**9
     if lag_min2 > tol_min and _parse_bool_env("REQUIRE_FRESH_DATA", True):
-        print(f"    ❌ 补拉后仍不新鲜: last={last_ts2} expected~={expected} (lag={lag_min2}m). 跳过该股票避免误判。", flush=True)
-        return pd.DataFrame()
+        msg = f"stale after refresh: last={last_ts2} expected~={expected} (lag={lag_min2}m)"
+        print(f"    [ERROR] Still stale after refresh: last={last_ts2} expected~={expected} (lag={lag_min2}m). Skip symbol.", flush=True)
+        raise StaleDataError(msg)
     return df_merged
 
 def _run_state_path() -> str:
@@ -245,16 +262,20 @@ def _schedule_gate() -> str | None:
     Uses ENFORCE_A_SHARE_SCHEDULE, A_SHARE_PUSH_SLOTS, A_SHARE_SLOT_LAG_MINUTES.
     """
     if not _parse_bool_env("ENFORCE_A_SHARE_SCHEDULE", False):
+        _write_run_status("RUN: manual (ENFORCE_A_SHARE_SCHEDULE is off)")
         return "manual"
 
     now_bj = _bj_now()
     trade_days = _load_trade_calendar()
     if not _is_trade_day(now_bj.date(), trade_days):
-        print(f"⏭️ 非交易日 {now_bj.date()}，跳过运行。", flush=True)
+        msg = f"SKIP: non-trading day {now_bj.date()} (Beijing)"
+        print(f"[SKIP] Non-trading day {now_bj.date()} (Beijing).", flush=True)
+        _write_run_status(msg)
         return None
 
     slots = _parse_hhmm_list(os.getenv("A_SHARE_PUSH_SLOTS", "1140,1520"))
     if not slots:
+        _write_run_status("RUN: manual (A_SHARE_PUSH_SLOTS is empty)")
         return "manual"
 
     lag_allow = int(os.getenv("A_SHARE_SLOT_LAG_MINUTES", "20"))
@@ -269,11 +290,16 @@ def _schedule_gate() -> str | None:
         if now_bj > (slot_dt + timedelta(minutes=lag_allow)):
             continue
         if str(state.get(day_key, {}).get(hhmm, "")):
-            print(f"⏭️ 今日 {day_key} 的 {hhmm} 已运行过，跳过。", flush=True)
+            msg = f"SKIP: already ran today {day_key} slot {hhmm}"
+            print(f"[SKIP] Already ran today {day_key} slot {hhmm}.", flush=True)
+            _write_run_status(msg)
             return None
+        _write_run_status(f"RUN: within slot {hhmm} (Beijing)")
         return hhmm
 
-    print(f"⏭️ 不在目标时间窗内（北京 {now_bj.strftime('%H:%M:%S')}），跳过。", flush=True)
+    msg = f"SKIP: outside time window (Beijing {now_bj.strftime('%H:%M:%S')})"
+    print(f"[SKIP] Outside time window (Beijing {now_bj}).", flush=True)
+    _write_run_status(msg)
     return None
 
 # ==========================================
@@ -547,7 +573,7 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
 
     # === C. 合并与单位修正 ===
     if df_bs.empty and df_ak.empty:
-        return {"df": pd.DataFrame(), "period": f"{tf_min}m"}
+        return {"df": pd.DataFrame(), "period": f"{tf_min}m", "empty_reason": "fetch_failed"}
     
     df_bs, df_ak = _detect_and_fix_volume_units(df_bs, df_ak)
     df_final = pd.concat([df_bs, df_ak], axis=0, ignore_index=True)
@@ -557,7 +583,10 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
     if len(df_final) > limit:
         df_final = df_final.tail(limit).reset_index(drop=True)
     # 校验是否为最新数据；若落后则尝试 AkShare 补拉最近几天再合并
-    df_final = _ensure_latest_data(symbol_code, tf_min, limit, df_final)
+    try:
+        df_final = _ensure_latest_data(symbol_code, tf_min, limit, df_final)
+    except StaleDataError:
+        return {"df": pd.DataFrame(), "period": f"{tf_min}m", "empty_reason": "stale_unfresh"}
     return {"df": df_final, "period": f"{tf_min}m"}
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -719,79 +748,162 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
 # 5. 主程序 (串行 + 30s 休息)
 # ==========================================
 
-def process_one_stock(symbol: str, position_info: dict):
-    if position_info is None: position_info = {}
+def process_one_stock(symbol: str, position_info: dict, stats: Optional[dict] = None):
+    if position_info is None:
+        position_info = {}
+
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     clean_symbol = clean_digits.zfill(6)
     tf_str = position_info.get("timeframe", "5")
     bars_str = position_info.get("bars", "500")
 
-    print(f"🚀 [{clean_symbol}] 开始分析 (TF:{tf_str}m, Bars:{bars_str})...", flush=True)
+    print(f"[RUN] [{clean_symbol}] start (TF:{tf_str}m, Bars:{bars_str})", flush=True)
     data_res = fetch_stock_data_dynamic(clean_symbol, tf_str, bars_str)
-    df = data_res["df"]
-    period = data_res["period"]
+    df = data_res.get("df", pd.DataFrame())
+    period = data_res.get("period", f"{tf_str}m")
 
-    if df.empty:
-        print(f"    ⚠️ [{clean_symbol}] 数据为空，跳过", flush=True)
+    if df is None or df.empty:
+        reason = data_res.get("empty_reason") or "empty"
+        if stats is not None:
+            if reason == "fetch_failed":
+                stats["data_fetch_failed"] = stats.get("data_fetch_failed", 0) + 1
+            elif reason == "stale_unfresh":
+                stats["data_stale_unfresh"] = stats.get("data_stale_unfresh", 0) + 1
+            else:
+                stats["data_empty_other"] = stats.get("data_empty_other", 0) + 1
+
+        if reason == "fetch_failed":
+            print(f"    [WARN] [{clean_symbol}] data fetch failed (BaoStock/AkShare empty); skip", flush=True)
+        elif reason == "stale_unfresh":
+            print(f"    [WARN] [{clean_symbol}] data stale/unfresh after refresh; skip", flush=True)
+        else:
+            print(f"    [WARN] [{clean_symbol}] empty data; skip", flush=True)
         return None
 
     df = add_indicators(df)
-    beijing_tz = timezone(timedelta(hours=8))
-    ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S")
+    ts = _bj_now().strftime("%Y%m%d_%H%M%S")
 
     chart_path = f"reports/{clean_symbol}_chart_{ts}.png"
     pdf_path = f"reports/{clean_symbol}_report_{period}_{ts}.pdf"
 
-    generate_local_chart(clean_symbol, df, chart_path, period)
-    report_text = ai_analyze(clean_symbol, df, position_info)
+    try:
+        generate_local_chart(clean_symbol, df, chart_path, period)
+        report_text = ai_analyze(clean_symbol, df, position_info)
+        ok = generate_pdf_report(clean_symbol, chart_path, report_text, pdf_path)
+    except Exception as e:
+        if stats is not None:
+            stats["exceptions"] = stats.get("exceptions", 0) + 1
+        print(f"    [ERROR] [{clean_symbol}] failed during chart/ai/pdf: {str(e)[:200]}", flush=True)
+        return None
 
-    if generate_pdf_report(clean_symbol, chart_path, report_text, pdf_path):
-        print(f"✅ [{clean_symbol}] 报告生成完毕", flush=True)
+    if ok:
+        if stats is not None:
+            stats["pdf_ok"] = stats.get("pdf_ok", 0) + 1
+        print(f"[OK] [{clean_symbol}] report generated", flush=True)
         return pdf_path
+
+    if stats is not None:
+        stats["pdf_failed"] = stats.get("pdf_failed", 0) + 1
+    print(f"    [ERROR] [{clean_symbol}] PDF generation failed", flush=True)
     return None
+
 
 def main():
     os.makedirs("data", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
+
     active_slot = _schedule_gate()
     if not active_slot:
         return
-    print("☁️ 正在连接 Google Sheets...", flush=True)
+
+    print("[INFO] Connecting Google Sheets...", flush=True)
     try:
         sm = SheetManager()
         stocks_dict = sm.get_all_stocks()
-        print(f"📋 获取 {len(stocks_dict)} 个任务", flush=True)
     except Exception as e:
-        print(f"❌ Sheet 连接失败: {e}", flush=True)
+        print(f"[ERROR] Google Sheets failed: {e}", flush=True)
+        _write_run_status(f"FAIL: google sheets error: {str(e)[:200]}")
         return
 
-    generated_pdfs = []
+    tasks = len(stocks_dict)
+    print(f"[TASKS] Loaded {tasks} tasks from Google Sheets.", flush=True)
+
+    stats = {
+        "tasks": tasks,
+        "pdf_ok": 0,
+        "pdf_failed": 0,
+        "data_fetch_failed": 0,
+        "data_stale_unfresh": 0,
+        "data_empty_other": 0,
+        "exceptions": 0,
+    }
+
+    _write_run_status(f"RUN: slot={active_slot}; tasks={tasks}")
+
+    generated_pdfs: list[str] = []
     items = list(stocks_dict.items())
+
     for i, (symbol, info) in enumerate(items):
         try:
-            pdf_path = process_one_stock(symbol, info)
-            if pdf_path: generated_pdfs.append(pdf_path)
+            pdf_path = process_one_stock(symbol, info, stats)
+            if pdf_path:
+                generated_pdfs.append(pdf_path)
         except Exception as e:
-            print(f"❌ [{symbol}] 处理发生异常: {e}", flush=True)
+            stats["exceptions"] += 1
+            print(f"[ERROR] [{symbol}] unhandled exception: {str(e)[:200]}", flush=True)
 
         if i < len(items) - 1:
-            print("⏳ 强制冷却 30秒...", flush=True)
             time.sleep(30)
 
     if generated_pdfs:
         with open("push_list.txt", "w", encoding="utf-8") as f:
-            for pdf in generated_pdfs: f.write(f"{pdf}\n")
-    else:
-        print("\n⚠️ 无报告生成", flush=True)
+            for pdf in generated_pdfs:
+                f.write(f"{pdf}\n")
 
-    # 记录本次时间窗已执行（用于高频 schedule 去重）
+        _write_run_status(
+            "DONE: generated_pdfs={n}; slot={slot}; tasks={tasks}; fetch_failed={ff}; stale_unfresh={su}; empty_other={eo}; pdf_failed={pf}; exceptions={ex}".format(
+                n=len(generated_pdfs),
+                slot=active_slot,
+                tasks=stats["tasks"],
+                ff=stats["data_fetch_failed"],
+                su=stats["data_stale_unfresh"],
+                eo=stats["data_empty_other"],
+                pf=stats["pdf_failed"],
+                ex=stats["exceptions"],
+            )
+        )
+    else:
+        if tasks == 0:
+            _write_run_status(f"NO_PUSH: no tasks configured; slot={active_slot}")
+        elif (stats["data_fetch_failed"] + stats["data_stale_unfresh"] + stats["data_empty_other"]) >= tasks and stats["exceptions"] == 0 and stats["pdf_failed"] == 0:
+            _write_run_status(
+                "NO_PUSH: data unavailable for all tasks (fetch_failed={ff}, stale_unfresh={su}, empty_other={eo}); slot={slot}".format(
+                    ff=stats["data_fetch_failed"],
+                    su=stats["data_stale_unfresh"],
+                    eo=stats["data_empty_other"],
+                    slot=active_slot,
+                )
+            )
+        else:
+            _write_run_status(
+                "NO_PUSH: no reports generated (tasks={tasks}, fetch_failed={ff}, stale_unfresh={su}, empty_other={eo}, pdf_failed={pf}, exceptions={ex}); slot={slot}".format(
+                    tasks=stats["tasks"],
+                    ff=stats["data_fetch_failed"],
+                    su=stats["data_stale_unfresh"],
+                    eo=stats["data_empty_other"],
+                    pf=stats["pdf_failed"],
+                    ex=stats["exceptions"],
+                    slot=active_slot,
+                )
+            )
+
+    # Mark slot executed to dedupe high-frequency schedules
     if active_slot and active_slot != "manual":
         state = _load_run_state()
         day_key = _bj_now().strftime("%Y-%m-%d")
         state.setdefault(day_key, {})
-        state[day_key][active_slot] = _bj_now().isoformat()
+        state[day_key][str(active_slot)] = _bj_now().isoformat()
         _save_run_state(state)
-
 if __name__ == "__main__":
     main()
 
